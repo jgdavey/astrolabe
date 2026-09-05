@@ -1,0 +1,15 @@
+/.cpcache/
+/.claude/
+/target/
+/*.log
+
+# clj-kondo cache and configs from libs
+/.clj-kondo/imports/
+/.clj-kondo/.cache/
+
+# clj-kondo config
+!/.clj-kondo/config.edn
+
+# clojure-lsp cache
+/.lsp/.cache
+
