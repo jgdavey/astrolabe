@@ -14,11 +14,13 @@
   returns an InputStream for non-GET requests and leaves the rest to you:
   - GET/DELETE read the `datastar` query param (per the SDK)
   - a body already parsed upstream (muuntaja's `:body-params`) is used as-is
-  - anything else is slurped to a string, with a blank body treated as absent
-    so an empty POST does not become a JSON parse error"
+  - anything else is slurped to a string
+  - either way, a blank payload is treated as absent, so an empty POST body
+    or an empty `?datastar=` query param does not become a JSON parse error"
   [req]
   (case (:request-method req)
-    (:get :delete) (get-in req [:query-params consts/datastar-key])
+    (:get :delete) (let [s (get-in req [:query-params consts/datastar-key])]
+                      (when-not (str/blank? s) s))
     (if (seq (:body-params req))
       (:body-params req)
       (let [raw (:body req)
