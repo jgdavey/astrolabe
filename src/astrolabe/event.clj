@@ -1,5 +1,6 @@
 (ns astrolabe.event
-  "Event data: vector sugar in, canonical maps out.")
+  "Event data: vector sugar in, canonical maps out."
+  (:require [starfederation.datastar.clojure.api :as d*]))
 
 (def op->primary
   "Maps an event op to the canonical key holding its primary argument."
@@ -41,3 +42,47 @@
     (map? event)    (normalize-map event)
     (vector? event) (normalize-vector event)
     :else (throw (ex-info "Event must be a vector or a map" {:event event}))))
+
+(def ^:private mode->const
+  {:outer   d*/pm-outer    :inner   d*/pm-inner
+   :remove  d*/pm-remove   :prepend d*/pm-prepend
+   :append  d*/pm-append   :before  d*/pm-before
+   :after   d*/pm-after    :replace d*/pm-replace})
+
+(def ^:private element-ns->const
+  {:html d*/ns-html :svg d*/ns-svg :mathml d*/ns-mathml})
+
+(defn- enum
+  "Translate a friendly keyword into its SDK constant. Strings pass through --
+  they are assumed to be SDK constants already, which is what hindsight's
+  `#(get patch-modes % %)` fallback bought. Unknown keywords throw, so a typo
+  is a loud error rather than a silently dropped option."
+  [table label v]
+  (cond
+    (string? v) v
+    (contains? table v) (get table v)
+    :else (throw (ex-info (str "Unknown " label " value")
+                          {label v :known (set (keys table))}))))
+
+;; friendly key -> [sdk key, value transform]
+(def ^:private opt-table
+  {:id                    [d*/id                   identity]
+   :retry-duration        [d*/retry-duration       identity]
+   :selector              [d*/selector             identity]
+   :mode                  [d*/patch-mode           #(enum mode->const :mode %)]
+   :use-view-transition?  [d*/use-view-transition  identity]
+   :element-ns            [d*/element-ns           #(enum element-ns->const :element-ns %)]
+   :only-if-missing?      [d*/only-if-missing      identity]
+   :auto-remove?          [d*/auto-remove          identity]
+   :attributes            [d*/attributes           identity]})
+
+(defn ->sdk-opts
+  "Translate a canonical event's friendly options into the SDK's option map.
+  Keys absent from the event are absent from the result; `false` is preserved."
+  [event]
+  (reduce-kv (fn [acc friendly [sdk-key xf]]
+               (if (contains? event friendly)
+                 (assoc acc sdk-key (xf (get event friendly)))
+                 acc))
+             {}
+             opt-table))

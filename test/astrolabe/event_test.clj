@@ -1,6 +1,7 @@
 (ns astrolabe.event-test
   (:require [clojure.test :refer [deftest is testing]]
-            [astrolabe.event :as event]))
+            [astrolabe.event :as event]
+            [starfederation.datastar.clojure.api :as d*]))
 
 (deftest vector-sugar-normalizes-to-canonical-map
   (testing "primary arg only"
@@ -51,3 +52,53 @@
   (testing "not a vector or map"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a vector or a map"
                           (event/normalize "nope")))))
+
+(deftest friendly-opts-map-onto-sdk-keys
+  (testing "patch-elements opts"
+    (is (= {d*/selector             "#lane-0"
+            d*/patch-mode           d*/pm-append
+            d*/use-view-transition  true
+            d*/retry-duration       500
+            d*/element-ns           d*/ns-svg
+            d*/id                   "evt-1"}
+           (event/->sdk-opts
+            {:op :patch-elements :elements "<div/>"
+             :selector "#lane-0" :mode :append :use-view-transition? true
+             :retry-duration 500 :element-ns :svg :id "evt-1"}))))
+
+  (testing "signals and script opts"
+    (is (= {d*/only-if-missing true}
+           (event/->sdk-opts {:op :patch-signals :signals {} :only-if-missing? true})))
+    (is (= {d*/auto-remove false d*/attributes {"type" "module"}}
+           (event/->sdk-opts {:op :execute-script :script "x"
+                              :auto-remove? false :attributes {"type" "module"}}))))
+
+  (testing "absent opts produce no keys"
+    (is (= {} (event/->sdk-opts {:op :patch-elements :elements "<div/>"}))))
+
+  (testing "false and nil are preserved, not dropped"
+    (is (= {d*/use-view-transition false}
+           (event/->sdk-opts {:op :patch-elements :elements "<div/>"
+                              :use-view-transition? false}))))
+
+  (testing "every documented mode keyword"
+    (doseq [[kw const] {:outer   d*/pm-outer   :inner   d*/pm-inner
+                        :append  d*/pm-append  :prepend d*/pm-prepend
+                        :before  d*/pm-before  :after   d*/pm-after
+                        :remove  d*/pm-remove  :replace d*/pm-replace}]
+      (is (= {d*/patch-mode const}
+             (event/->sdk-opts {:op :patch-elements :elements "x" :mode kw}))
+          (str "mode " kw))))
+
+  (testing "raw SDK constants pass through untouched"
+    (is (= {d*/patch-mode "append"}
+           (event/->sdk-opts {:op :patch-elements :elements "x" :mode "append"}))
+        "a string is assumed to already be an SDK constant")
+    (is (= {d*/element-ns d*/ns-svg}
+           (event/->sdk-opts {:op :patch-elements :elements "x" :element-ns d*/ns-svg}))))
+
+  (testing "unknown enum keywords throw"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown :mode"
+                          (event/->sdk-opts {:op :patch-elements :elements "x" :mode :sideways})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown :element-ns"
+                          (event/->sdk-opts {:op :patch-elements :elements "x" :element-ns :xaml})))))
