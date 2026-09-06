@@ -13,3 +13,6 @@
 # clojure-lsp cache
 /.lsp/.cache
 
+
+# subagent-driven-development workspace
+/.superpowers/
