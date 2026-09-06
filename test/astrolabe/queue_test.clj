@@ -1,6 +1,23 @@
 (ns astrolabe.queue-test
   (:require [clojure.test :refer [deftest is testing]]
-            [astrolabe.queue :as queue]))
+            [astrolabe.queue :as queue])
+  (:import [java.lang Thread$State]))
+
+(defn- await-parked!
+  "Spin until thread `t` has genuinely parked (WAITING or TIMED_WAITING),
+  so a caller can be sure `t` is blocked before acting on shared state.
+  Fails loudly (rather than hanging the suite) if `t` never parks within
+  `timeout-ms`."
+  [^Thread t timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)
+        parked?  #{Thread$State/WAITING Thread$State/TIMED_WAITING}]
+    (loop []
+      (cond
+        (parked? (.getState t)) true
+        (> (System/currentTimeMillis) deadline)
+        (throw (ex-info "thread never parked before timeout"
+                         {:state (.getState t) :timeout-ms timeout-ms}))
+        :else (do (Thread/sleep 1) (recur))))))
 
 (deftest bounded-refuses-when-full
   (let [q (queue/bounded 2)]
@@ -30,6 +47,7 @@
     (testing label
       (let [result (promise)
             t (Thread/startVirtualThread #(deliver result (queue/take! q)))]
+        (await-parked! t 1000)
         (is (not (realized? result)) "take! has not returned yet")
         (queue/offer! q :frame)
         (is (= :frame (deref result 1000 ::timeout)))
@@ -42,6 +60,7 @@
     (testing label
       (let [result (promise)
             t (Thread/startVirtualThread #(deliver result (queue/take! q)))]
+        (await-parked! t 1000)
         (queue/close! q)
         (is (nil? (deref result 1000 ::timeout)) "closed queues return nil, ending the drain loop")
         (.join t)))))

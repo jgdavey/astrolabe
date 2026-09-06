@@ -14,26 +14,30 @@
 
 (def ^:private CLOSED ::closed)
 
-(deftype BlockingFrameQueue [^LinkedBlockingQueue q]
+(deftype BlockingFrameQueue [^LinkedBlockingQueue q ^:volatile-mutable closed?]
   Queue
-  (offer! [_ frame] (.offer q frame))
+  (offer! [_ frame] (if closed? false (.offer q frame)))
   (take!  [_] (let [v (.take q)]
                 (if (identical? v CLOSED)
                   (do (.offer q CLOSED) nil)   ; stay closed for any other taker
                   v)))
-  (close! [_] (.clear q) (.offer q CLOSED) nil))
+  (close! [_]
+    (set! closed? true)
+    (.clear q)
+    (while (not (.offer q CLOSED)) (.poll q))
+    nil))
 
 (defn bounded
   "A queue holding at most `n` frames. Refuses further frames when full, which
   closes the connection so the client reconnects and resyncs. Use for
   event-based topics, where dropping a delta would diverge the client silently."
   [n]
-  (->BlockingFrameQueue (LinkedBlockingQueue. (int n))))
+  (->BlockingFrameQueue (LinkedBlockingQueue. (int n)) false))
 
 (defn unbounded
   "A queue that never refuses and grows without limit. Useful in tests."
   []
-  (->BlockingFrameQueue (LinkedBlockingQueue.)))
+  (->BlockingFrameQueue (LinkedBlockingQueue.) false))
 
 (deftype LatestFrameQueue [^ReentrantLock lock
                            ^Condition ready
