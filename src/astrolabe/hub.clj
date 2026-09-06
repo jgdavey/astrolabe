@@ -2,7 +2,8 @@
   "A topic-keyed registry of open SSE connections."
   (:refer-clojure :exclude [meta])
   (:require [astrolabe.queue :as queue]
-            [astrolabe.sse :as sse]))
+            [astrolabe.sse :as sse]
+            [starfederation.datastar.clojure.api :as d*]))
 
 (defrecord Connection [sse-gen queue topic meta])
 
@@ -98,23 +99,39 @@
   "Return SSE response data that subscribes to `topic`, holds the connection
   open by draining its queue, and unsubscribes when the client disconnects.
 
+  Disconnect detection lives here. The SDK never throws when a client goes
+  away -- the adapter catches the IOException, closes the generator, and every
+  later write silently returns false -- so `connect!`'s `write!` closes the
+  queue as soon as `sse/apply!` reports a closed connection. That ends the
+  drain loop, and the cleanup below unsubscribes and closes the generator.
+  Cleanup is owned by `connect!`, not by the drain, so a custom `:drain`
+  inherits all of it.
+
   Opts:
-  - `:meta` app data attached to the connection, readable with [[meta]]"
+  - `:meta`         app data attached to the connection, readable with [[meta]]
+  - `:on-close`     SDK on-close callback, passed through to the response
+  - `:on-exception` SDK on-exception callback, passed through to the response"
   ([hub topic] (connect! hub topic {}))
-  ([hub topic {m :meta}]
+  ([hub topic {m :meta :keys [on-close on-exception]}]
    (sse/response
-    {:on-open
-     (fn [sse-gen]
-       ;; the queue-fn sees the connection, so build it in two steps
-       (let [proto (->Connection sse-gen nil topic m)
-             q     ((:queue-fn hub) proto)
-             conn  (assoc proto :queue q)
-             write! (fn [frame] (sse/apply! (:interpreter hub) sse-gen frame))]
-         (-subscribe! hub topic conn)
-         (try
-           ((:drain hub) conn q write!)
-           (catch Exception _
-             nil)   ; a dead client is normal; fall through to cleanup
-           (finally
-             (-unsubscribe! hub topic conn)
-             (queue/close! q)))))})))
+    (cond-> {:on-open
+             (fn [sse-gen]
+               ;; the queue-fn sees the connection, so build it in two steps
+               (let [proto (->Connection sse-gen nil topic m)
+                     q     ((:queue-fn hub) proto)
+                     conn  (assoc proto :queue q)
+                     write! (fn [frame]
+                              (when-not (sse/apply! (:interpreter hub) sse-gen frame)
+                                ;; the client is gone; end the drain loop
+                                (queue/close! q)))]
+                 (-subscribe! hub topic conn)
+                 (try
+                   ((:drain hub) conn q write!)
+                   (catch Exception _
+                     nil)   ; a dead client is normal; fall through to cleanup
+                   (finally
+                     (-unsubscribe! hub topic conn)
+                     (queue/close! q)
+                     (d*/close-sse! sse-gen)))))}
+      on-close     (assoc :on-close on-close)
+      on-exception (assoc :on-exception on-exception)))))

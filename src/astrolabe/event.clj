@@ -66,19 +66,27 @@
 
 ;; friendly key -> [sdk key, value transform]
 (def ^:private opt-table
-  {:id                    [d*/id                   identity]
-   :retry-duration        [d*/retry-duration       identity]
-   :selector              [d*/selector             identity]
-   :mode                  [d*/patch-mode           #(enum mode->const :mode %)]
-   :use-view-transition?  [d*/use-view-transition  identity]
-   :element-ns            [d*/element-ns           #(enum element-ns->const :element-ns %)]
-   :only-if-missing?      [d*/only-if-missing      identity]
-   :auto-remove?          [d*/auto-remove          identity]
-   :attributes            [d*/attributes           identity]})
+  {:id                       [d*/id                       identity]
+   :retry-duration           [d*/retry-duration           identity]
+   :selector                 [d*/selector                 identity]
+   :mode                     [d*/patch-mode               #(enum mode->const :mode %)]
+   :use-view-transition?     [d*/use-view-transition      identity]
+   :view-transition-selector [d*/view-transition-selector identity]
+   :element-ns               [d*/element-ns               #(enum element-ns->const :element-ns %)]
+   :only-if-missing?         [d*/only-if-missing          identity]
+   :auto-remove?             [d*/auto-remove              identity]
+   :attributes               [d*/attributes               identity]})
 
 (defn ->sdk-opts
   "Translate a canonical event's friendly options into the SDK's option map.
-  Keys absent from the event are absent from the result; `false` is preserved."
+  Keys absent from the event are absent from the result; `false` is preserved.
+
+  Only the keys in `opt-table` are translated. Any other key on the event --
+  `:op`, the primary-argument key, and whatever else a caller is carrying
+  along -- is dropped silently rather than throwing, so callers can decorate
+  event maps with their own data and so a future SDK option is not a hard
+  error. Unlike an unknown op or an unknown enum value, an unknown option key
+  is therefore not an error; a typo in one is silently ignored."
   [event]
   (reduce-kv (fn [acc friendly [sdk-key xf]]
                (if (contains? event friendly)

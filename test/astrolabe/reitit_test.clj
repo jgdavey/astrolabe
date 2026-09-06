@@ -113,6 +113,34 @@
          (ac/write-profile opts default-write-profile) only falls back to its default when
          the key is missing entirely")))
 
+(deftest vary-is-set-when-compression-is-negotiated
+  (let [captured (atom nil)
+        capture-response (fn [_req opts] (reset! captured opts) {:status 200})
+        handler (app [["/x" {:datastar true :post (fn [_] (sse/response {:events []}))}]]
+                     :->sse-response capture-response)]
+
+    (handler {:request-method :post :uri "/x" :body "{}"
+              :headers {"accept-encoding" "gzip"}})
+    (is (= "Accept-Encoding" (get-in @captured [:headers "Vary"]))
+        "a negotiated response varies by Accept-Encoding, so shared caches must be told")
+
+    (handler {:request-method :post :uri "/x" :body "{}" :headers {}})
+    (is (nil? (get-in @captured [:headers "Vary"]))
+        "no negotiation, no Vary")))
+
+(deftest user-headers-override-vary
+  (let [captured (atom nil)
+        capture-response (fn [_req opts] (reset! captured opts) {:status 200})
+        handler (app [["/x" {:datastar true
+                             :post (fn [_] (sse/response
+                                            {:events []
+                                             :headers {"Vary" "Accept-Encoding, Cookie"
+                                                       "X-Test" "1"}}))}]]
+                     :->sse-response capture-response)]
+    (handler {:request-method :post :uri "/x" :body "{}"
+              :headers {"accept-encoding" "gzip"}})
+    (is (= {"Vary" "Accept-Encoding, Cookie" "X-Test" "1"} (:headers @captured)))))
+
 (deftest sdk-callbacks-and-response-fields-are-passed-through
   (let [captured (atom nil)
         capture-response (fn [_req opts] (reset! captured opts) {:status 200})

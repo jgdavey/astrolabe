@@ -50,7 +50,12 @@
 (defn- ->response
   [{:keys [->sse-response interpreter compression]} req resp]
   (let [profile (or (:write-profile resp)
-                    (compression/negotiate compression (get-in req [:headers "accept-encoding"])))]
+                    (compression/negotiate compression (get-in req [:headers "accept-encoding"])))
+        ;; the response body varies with Accept-Encoding whenever we negotiated
+        ;; one, so say so for any shared cache in front of us. A user-supplied
+        ;; header still wins.
+        headers (merge (when profile {"Vary" "Accept-Encoding"})
+                       (:headers resp))]
     (->sse-response
      req
      (cond-> {ac/on-open (->on-open interpreter resp)}
@@ -58,11 +63,14 @@
        (:on-close resp)      (assoc ac/on-close (:on-close resp))
        (:on-exception resp)  (assoc ac/on-exception (:on-exception resp))
        (:status resp)        (assoc :status (:status resp))
-       (:headers resp)       (assoc :headers (:headers resp))))))
+       (seq headers)         (assoc :headers headers)))))
 
 (defn middleware
   "Reitit middleware for Datastar routes. Applies only to routes with
   `:datastar true`.
+
+  Synchronous 1-arity ring handlers only. Reitit's async mode (3-arity
+  handlers taking `[request respond raise]`) is not supported.
 
   Opts:
   - `:->sse-response` the SDK adapter's ->sse-response (required)

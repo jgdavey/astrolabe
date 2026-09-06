@@ -6,9 +6,9 @@ SDK** — not a replacement for it.
 
 `astrolabe` adds the ergonomic and integration layer the SDK deliberately leaves
 out: a data-first event API, first-class [reitit](https://github.com/metosin/reitit)
-wiring, Brotli compression on by default, and a small connection registry for
-broadcasting to many clients — while staying agnostic about your web server and
-owning none of your application state.
+wiring, content-negotiated compression (gzip by default, Brotli opt-in), and a
+small connection registry for broadcasting to many clients — while staying
+agnostic about your web server and owning none of your application state.
 
 > **Status: alpha.** API is expected to change.
 
@@ -27,8 +27,9 @@ using it directly leaves you writing the same glue every project needs:
 - Remembering to turn compression on at all.
 
 `astrolabe` packages those patterns. It is a thin layer: events are interpreted
-straight onto the SDK's generator, and compression is just the SDK's own
-`brotli` write-profile, switched on by default.
+straight onto the SDK's generator, and compression is just the SDK's own write
+profiles — `gzip` by default, since it ships in the SDK core, with `brotli`
+available opt-in — chosen per request from the client's `Accept-Encoding`.
 
 ### Non-goals
 
@@ -164,7 +165,7 @@ missing primary arg throws.
 
 | `op`                  | primary key | primary value              | common opts |
 |-----------------------|-------------|----------------------------|-------------|
-| `:patch-elements`     | `:elements` | hiccup or HTML string      | `:selector` `:mode` `:use-view-transition?` `:retry-duration` `:element-ns` |
+| `:patch-elements`     | `:elements` | hiccup or HTML string      | `:selector` `:mode` `:use-view-transition?` `:view-transition-selector` `:retry-duration` `:element-ns` |
 | `:patch-elements-seq` | `:elements` | seq of the above           | (as above) |
 | `:patch-signals`      | `:signals`  | a map, or a JSON string    | `:only-if-missing?` |
 | `:remove-element`     | `:selector` | CSS selector string        | |
@@ -173,6 +174,13 @@ missing primary arg throws.
 `:mode` accepts friendly keywords — `:outer` `:inner` `:append` `:prepend`
 `:before` `:after` `:remove` `:replace` — mapped onto the SDK's patch-mode
 constants for you. Every op also accepts `:id` (the SSE event id).
+`:view-transition-selector` is applied by Datastar only when
+`:use-view-transition?` is true.
+
+Only the options in the table above are translated; every other key on an event
+map is ignored rather than rejected, so you can carry your own data alongside an
+event. The tradeoff is that a *misspelled* option key is dropped silently — an
+unknown `op` or an unknown enum value still throws.
 
 A `:patch-signals` map is serialized with the interpreter's `:write-json`; a
 string is sent as-is. Passing a map with no `:write-json` configured throws.
@@ -188,6 +196,12 @@ For any `:datastar true` route, `astrolabe` reads the Datastar payload (the
   (let [title (:cardTitle signals)]
     ...))
 ```
+
+On GET and DELETE, Datastar sends signals as the `datastar` **query parameter**,
+and `astrolabe` reads them from `[:query-params "datastar"]` — the key ring's
+`wrap-params` (or reitit's parameters middleware) populates. Without one of
+those in your middleware chain, a GET Datastar route sees no signals at all, and
+does so silently. POST and the other methods read the body and are unaffected.
 
 ## Broadcasting
 
@@ -264,8 +278,14 @@ site where the distinction costs something. Call `frame` yourself.
 
 `send!` enqueues rather than writes, so neither broadcast blocks on a slow
 client — see [Delivery & concurrency](#delivery--concurrency). A connection
-that has gone away is unsubscribed by its own drain loop; the fan-out never
-sees the failure, and one dead client cannot abort a broadcast.
+that has gone away is unsubscribed on its own thread, by the `connect!` that is
+holding it open; the fan-out never sees the failure, and one dead client cannot
+abort a broadcast.
+
+That guarantee is about *delivery*. `broadcast-each!` still calls your `f` and
+renders inline, so an exception thrown while rendering for one connection does
+propagate out of `broadcast-each!` and skips the connections after it. If a
+per-connection render can fail, catch inside `f`.
 
 ### Connection metadata
 
@@ -279,6 +299,9 @@ app-supplied metadata that rides along with the connection:
   (fn [conn] (views/board @!state (:uid (hub/meta conn)))))
 ```
 
+`connect!` also accepts `:on-close` and `:on-exception`, passed straight through
+to the SDK adapter as the corresponding callbacks.
+
 ### Hub API
 
 ```clojure
@@ -286,12 +309,23 @@ app-supplied metadata that rides along with the connection:
 (hub/send!           hub conn frame)   ; enqueue one frame for one connection
 (hub/broadcast!      hub topic events) ; render once; send to every conn on topic
 (hub/broadcast-each! hub topic f)      ; f : conn → events; render per connection
-(hub/subscribe!      hub topic conn)   ; register; returns a promise realized on disconnect
+(hub/subscribe!      hub topic conn)   ; register a connection on a topic
 (hub/unsubscribe!    hub topic conn)
 (hub/conns           hub topic)        ; current connections on topic
 (hub/meta            conn)             ; app data supplied at connect!
 (hub/connect!        hub topic opts?)  ; a datastar response that holds open + (un)subscribes
 ```
+
+`connect!` owns the connection lifecycle: it subscribes, drains, and
+unsubscribes. `subscribe!`/`unsubscribe!` are the raw registry operations
+underneath it — reach for them only when you are managing a connection's
+lifetime yourself.
+
+A `Connection` belongs to exactly one topic: it carries its `:topic`, and that
+is the topic it is removed from when it has to be closed. Do not use
+`subscribe!` to place one connection on a second topic — the second
+subscription will not be cleaned up. Give a client one connection per topic, or
+broadcast to a topic it is already on.
 
 `in-memory` is single-node: connections live in one process and are lost on
 restart (browsers reconnect via Datastar's SSE retry). The `Hub` protocol is the
@@ -439,16 +473,31 @@ until the client disconnects:
 
 ```clojure
 ;; connect!, in essence
-(subscribe! hub topic conn)
-(try
-  (drain conn queue write!)   ; blocks until the queue closes
-  (finally (unsubscribe! hub topic conn)))
+(let [write! (fn [frame]
+               ;; a write reporting a closed connection ends the drain loop
+               (when-not (sse/apply! interpreter sse-gen frame)
+                 (queue/close! queue)))]
+  (subscribe! hub topic conn)
+  (try
+    (drain conn queue write!)   ; blocks until the queue closes
+    (finally
+      (unsubscribe! hub topic conn)
+      (queue/close! queue)
+      (d*/close-sse! sse-gen))))
 ```
 
-On synchronous adapters this borrows the request's own virtual thread, so no
-extra thread exists per connection. On async adapters (http-kit, Aleph) there is
-no request thread to borrow and `connect!` spawns one. The API and the semantics
-are identical either way.
+A disconnected client is detected on the write, not by an exception: the SDK's
+adapters swallow the IOException and every later write returns `false`. That
+`false` closes the queue, which ends the drain, which runs the cleanup above.
+
+`connect!` spawns nothing. Its `on-open` blocks until the connection ends, on
+every adapter — so whichever thread the adapter calls `on-open` on is the thread
+that holds the connection open. On synchronous adapters that is the request's
+own thread, which is exactly what keeps the response body streaming, so no extra
+thread exists per connection. On async adapters (http-kit, Aleph) `on-open` runs
+on a carrier thread of the server's own pool, and blocking it for the life of
+the connection is your responsibility to account for: run those adapters on
+virtual threads, or hand `connect!`'s `:on-open` to a thread you control.
 
 ### Adapters and held connections
 
@@ -461,12 +510,14 @@ blocking in `on-open` blocks `write-body-to-stream`, and that is precisely what
 holds the stream open. The stream lives as long as `on-open` blocks, not as long
 as the handler runs.
 
-The cost is thread occupancy: on a synchronous adapter each held connection
-occupies a container thread for its lifetime. Run Jetty's thread pool on virtual
-threads (Jetty 12 exposes a virtual-thread executor, and `ring-jetty-adapter`
-accepts a `:thread-pool`) or the number of concurrent SSE connections you can
-hold is capped by pool size. Async adapters (http-kit, Aleph) don't have this
-constraint, since there is no container thread to hold.
+The cost is thread occupancy: a held connection occupies whatever thread the
+adapter called `on-open` on, for its lifetime. On synchronous Ring/Jetty that is
+a container thread — run Jetty's thread pool on virtual threads (Jetty 12
+exposes a virtual-thread executor, and `ring-jetty-adapter` accepts a
+`:thread-pool`) or the number of concurrent SSE connections you can hold is
+capped by pool size. Async adapters (http-kit, Aleph) have no container thread
+per request, but `connect!` still blocks wherever they run `on-open`, so budget
+for that too rather than assuming the block is free.
 
 The request/response style — `sse/response` with `:auto-close? true`, the
 default — is unaffected either way, on any adapter.
@@ -541,9 +592,18 @@ doesn't ship — dedupe, for instance, is three lines:
 Because frames are plain values, `=` is the whole test. Batching — drain
 everything pending, write once — is the other natural one.
 
-A custom drain loop owns its own error handling. The default catches write
-failures, closes the connection and unsubscribes it; a replacement that doesn't
-will leak subscriptions when a client disappears mid-write.
+A custom drain loop does **not** have to own cleanup. The `try`/`finally` lives
+in `connect!`, outside the drain, so whatever drain you supply, `connect!`
+unsubscribes the connection, closes its queue and closes the SSE generator once
+the drain returns or throws. `default-drain` itself contains no error handling
+at all.
+
+Disconnect detection is likewise `connect!`'s: the `write!` it hands your drain
+closes the queue as soon as a write reports the connection closed, which ends
+your `take!` loop the same way an explicit `close!` would. The SDK never throws
+on an ordinary disconnect — its adapters catch the IOException and report the
+closure as a `false` return from the next write — so a drain that tries to
+detect a dead client by catching exceptions will not see one.
 
 ## Prior art & thanks
 

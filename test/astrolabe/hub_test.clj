@@ -3,7 +3,9 @@
             [astrolabe.hub :as hub]
             [astrolabe.queue :as queue]
             [astrolabe.sse :as sse]
-            [starfederation.datastar.clojure.adapter.test :as adapter.test]))
+            [starfederation.datastar.clojure.adapter.test :as adapter.test]
+            [starfederation.datastar.clojure.protocols :as p])
+  (:import [java.util.concurrent.locks ReentrantLock]))
 
 (def itp (sse/interpreter {:render str :write-json pr-str}))
 
@@ -13,6 +15,33 @@
   ([topic] (test-conn topic {}))
   ([topic meta]
    (hub/->Connection (adapter.test/->sse-recorder) (queue/unbounded) topic meta)))
+
+(defrecord FailingGen [lock !writes !closed? max-writes]
+  p/SSEGenerator
+  (send-event! [_ _ _ _] (<= (swap! !writes inc) max-writes))
+  (get-lock [_] lock)
+  (close-sse! [_] (reset! !closed? true))
+  (sse-gen? [_] true))
+
+(defn ->failing-gen
+  "An SSEGenerator that reports a closed connection -- `false` out of
+  `send-event!`, with no exception -- after `max-writes` successful writes.
+
+  That is what the SDK actually does when a client goes away: the adapter
+  catches the IOException internally, `on-exception` closes the generator, and
+  every later write silently returns false. `adapter.test/->sse-recorder` can
+  never fail, so a connection leak on this path is invisible to it."
+  [max-writes]
+  (->FailingGen (ReentrantLock.) (atom 0) (atom false) max-writes))
+
+(defn- wait-for
+  "Poll `pred` for up to ~2s, returning its last value."
+  [pred]
+  (loop [n 0]
+    (let [v (pred)]
+      (if (or v (>= n 200))
+        v
+        (do (Thread/sleep 10) (recur (inc n)))))))
 
 (deftest subscribe-and-unsubscribe
   (let [h (test-hub)
@@ -85,8 +114,14 @@
     (hub/broadcast! h :room [[:patch-elements "<div/>"]])
 
     (is (= 1 @renders) "one render, no matter how many subscribers")
-    (let [frames (map drain-one [a b c])]
-      (is (apply = frames) "every connection got the identical frame"))))
+    ;; name the expected frame: `(apply = frames)` would be vacuously true if
+    ;; all three drain-one calls timed out, since ::timeout equals ::timeout.
+    ;; `itp` renders with plain `str`, so it produces the same frame without
+    ;; disturbing the render count.
+    (let [expected (sse/frame itp [[:patch-elements "<div/>"]])
+          frames   (mapv drain-one [a b c])]
+      (is (= [expected expected expected] frames)
+          "every connection got the identical frame"))))
 
 (deftest broadcast-each!-renders-per-connection
   (let [renders (atom 0)
@@ -120,8 +155,15 @@
         slow (hub/->Connection (adapter.test/->sse-recorder) (queue/latest) :room {})
         fast (test-conn :room)]
     (doseq [conn [slow fast]] (hub/subscribe! h :room conn))
-    ;; nobody is draining `slow`; broadcast must still return promptly
-    (dotimes [_ 100] (hub/broadcast! h :room [[:remove-element "#x"]]))
+    ;; nobody is draining `slow`; broadcast must still return promptly. Run the
+    ;; loop under a deadline so a stalling broadcast! fails instead of hanging
+    ;; the whole suite.
+    (let [done (promise)]
+      (Thread/startVirtualThread
+       #(do (dotimes [_ 100] (hub/broadcast! h :room [[:remove-element "#x"]]))
+            (deliver done true)))
+      (is (true? (deref done 5000 ::timeout))
+          "100 broadcasts to an undrained connection finish well inside 5s"))
     (is (= 2 (count (hub/conns h :room))) "a latest-queue never refuses, so nobody is dropped")))
 
 (deftest connect!-holds-open-drains-and-cleans-up
@@ -153,7 +195,8 @@
 
       (is (true? (deref done 1000 ::timeout)) "closing the queue ends the drain loop")
       (.join t)
-      (is (= [] (hub/conns h :room)) "connect! unsubscribes on the way out"))))
+      (is (= [] (hub/conns h :room)) "connect! unsubscribes on the way out")
+      (is (false? @(:!open? gen)) "connect! closes the SSE generator on the way out"))))
 
 (deftest a-custom-drain-loop-can-dedupe
   (let [h (hub/in-memory
@@ -174,3 +217,37 @@
         (Thread/sleep 20))
       (is (= 1 (count @(:!rec gen))) "identical frames are written once")
       (queue/close! (:queue conn)))))
+
+(deftest a-closed-connection-is-unsubscribed-by-its-drain-loop
+  (let [h    (test-hub)
+        resp (hub/connect! h :room)
+        gen  (->failing-gen 0)   ; every write reports a closed connection
+        done (promise)]
+    (Thread/startVirtualThread #(do ((:on-open resp) gen) (deliver done true)))
+    (is (wait-for #(seq (hub/conns h :room))) "connect! subscribed")
+
+    (hub/broadcast! h :room [[:remove-element "#x"]])
+
+    (is (wait-for #(pos? @(:!writes gen))) "the drain loop attempted the write")
+    (is (true? (deref done 2000 ::timeout))
+        "a write reporting a closed connection ends the drain loop")
+    (is (= [] (hub/conns h :room))
+        "the dead connection is unsubscribed, not left on the topic forever")
+    (is (true? @(:!closed? gen))
+        "connect! closes the SSE generator on the way out")))
+
+(deftest every-event-in-a-frame-is-attempted-even-after-a-failure
+  (let [h    (test-hub)
+        resp (hub/connect! h :room)
+        gen  (->failing-gen 0)
+        done (promise)]
+    (Thread/startVirtualThread #(do ((:on-open resp) gen) (deliver done true)))
+    (is (wait-for #(seq (hub/conns h :room))))
+
+    (hub/broadcast! h :room [[:remove-element "#a"]
+                             [:remove-element "#b"]
+                             [:remove-element "#c"]])
+
+    (is (true? (deref done 2000 ::timeout)) "the drain loop ended")
+    (is (= 3 @(:!writes gen))
+        "a failing write does not skip the rest of the frame")))

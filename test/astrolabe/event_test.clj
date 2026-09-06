@@ -79,7 +79,24 @@
   (testing "false and nil are preserved, not dropped"
     (is (= {d*/use-view-transition false}
            (event/->sdk-opts {:op :patch-elements :elements "<div/>"
-                              :use-view-transition? false}))))
+                              :use-view-transition? false})))
+    (is (= {d*/selector nil}
+           (event/->sdk-opts {:op :patch-elements :elements "<div/>"
+                              :selector nil}))
+        "an explicit nil is a present key, not an absent one"))
+
+  (testing "view-transition-selector reaches the SDK"
+    (is (= {d*/use-view-transition true
+            d*/view-transition-selector "#x"}
+           (event/->sdk-opts {:op :patch-elements :elements "<div/>"
+                              :use-view-transition? true
+                              :view-transition-selector "#x"}))))
+
+  (testing "unknown option keys are dropped silently"
+    (is (= {d*/selector "#a"}
+           (event/->sdk-opts {:op :patch-elements :elements "<div/>"
+                              :selector "#a" :my/trace-id 7}))
+        "callers may carry their own data on an event map"))
 
   (testing "every documented mode keyword"
     (doseq [[kw const] {:outer   d*/pm-outer   :inner   d*/pm-inner

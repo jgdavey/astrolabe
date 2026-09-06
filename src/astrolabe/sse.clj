@@ -41,23 +41,35 @@
   [itp events]
   (mapv #(render-event itp (event/normalize %)) events))
 
+(defn- write-one!
+  "Write one canonical event to an SDK sse-gen, returning the SDK's own boolean:
+  `false` if the connection is closed, `true` otherwise."
+  [sse-gen ev]
+  (let [opts (event/->sdk-opts ev)]
+    (case (:op ev)
+      :patch-elements     (d*/patch-elements!     sse-gen (:elements ev) opts)
+      :patch-elements-seq (d*/patch-elements-seq! sse-gen (:elements ev) opts)
+      :patch-signals      (d*/patch-signals!      sse-gen (:signals ev)  opts)
+      :remove-element     (d*/remove-element!     sse-gen (:selector ev) opts)
+      :execute-script     (d*/execute-script!     sse-gen (:script ev)   opts))))
+
 (defn apply!
-  "Write a frame to an SDK sse-gen."
+  "Write a frame to an SDK sse-gen.
+
+  Returns `false` if any write reported the connection closed, `true`
+  otherwise. Every event in the frame is attempted regardless -- a failure
+  never skips the rest of the frame, only the verdict is affected. This is the
+  only signal a caller gets that a client has gone away: the SDK's adapters
+  catch the disconnect internally and report it as a `false` return, never as
+  an exception."
   [_itp sse-gen frame]
-  (doseq [ev frame]
-    (let [opts (event/->sdk-opts ev)]
-      (case (:op ev)
-        :patch-elements     (d*/patch-elements!     sse-gen (:elements ev) opts)
-        :patch-elements-seq (d*/patch-elements-seq! sse-gen (:elements ev) opts)
-        :patch-signals      (d*/patch-signals!      sse-gen (:signals ev)  opts)
-        :remove-element     (d*/remove-element!     sse-gen (:selector ev) opts)
-        :execute-script     (d*/execute-script!     sse-gen (:script ev)   opts))))
-  nil)
+  (reduce (fn [ok ev] (if (write-one! sse-gen ev) ok false)) true frame))
 
 (defn response
   "Describe an SSE response as data. The middleware turns this into a streaming
-  response. Either `:events` (write them, then close) or `:on-open` (take over
-  the connection) must be present.
+  response. Normally it carries either `:events` (write them, then close) or
+  `:on-open` (take over the connection, as `hub/connect!` does); neither is
+  enforced, and `{:events []}` is a legitimate empty response.
 
   Keys:
   - `:events`        event data to write

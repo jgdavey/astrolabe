@@ -19,7 +19,10 @@
   (offer! [_ frame] (if closed? false (.offer q frame)))
   (take!  [_] (let [v (.take q)]
                 (if (identical? v CLOSED)
-                  (do (.offer q CLOSED) nil)   ; stay closed for any other taker
+                  ;; put the sentinel back so any other taker also sees the
+                  ;; close; same retry as `close!`, since a full queue would
+                  ;; otherwise swallow it
+                  (do (while (not (.offer q CLOSED)) (.poll q)) nil)
                   v)))
   (close! [_]
     (set! closed? true)

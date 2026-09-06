@@ -65,6 +65,35 @@
       (is (re-find #"mode append" (first events)))
       (is (re-find #"event: datastar-patch-signals" (second events))))))
 
+(defn- ->counting-gen
+  "An SSEGenerator whose `send-event!` succeeds `max-writes` times and reports
+  a closed connection -- `false`, never an exception -- from then on, the way
+  the SDK's adapters behave once a client has gone away."
+  [!writes max-writes]
+  (reify p/SSEGenerator
+    (send-event! [_ _ _ _] (<= (swap! !writes inc) max-writes))
+    (get-lock [_] nil)
+    (close-sse! [_] true)
+    (sse-gen? [_] true)))
+
+(deftest apply!-reports-whether-the-connection-is-still-open
+  (let [f (sse/frame itp [[:remove-element "#a"]
+                          [:remove-element "#b"]
+                          [:remove-element "#c"]])]
+    (testing "an open connection"
+      (is (true? (sse/apply! itp (->counting-gen (atom 0) 3) f))))
+
+    (testing "a closed connection"
+      (let [!writes (atom 0)]
+        (is (false? (sse/apply! itp (->counting-gen !writes 0) f)))
+        (is (= 3 @!writes)
+            "every event is still attempted; only the verdict changes")))
+
+    (testing "a connection that closes mid-frame"
+      (let [!writes (atom 0)]
+        (is (false? (sse/apply! itp (->counting-gen !writes 1) f)))
+        (is (= 3 @!writes))))))
+
 (deftest response-tags-data-for-the-middleware
   (let [r (sse/response {:events [[:remove-element "#x"]]})]
     (is (sse/response? r))
