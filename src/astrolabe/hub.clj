@@ -1,23 +1,21 @@
 (ns astrolabe.hub
-  "A topic-keyed registry of open SSE connections."
-  (:refer-clojure :exclude [meta])
-  (:require [astrolabe.queue :as queue]
-            [astrolabe.sse :as sse]
-            [starfederation.datastar.clojure.api :as d*]))
+  "A topic-keyed registry of open SSE connections.
 
-(defrecord Connection [sse-gen queue topic meta])
-
-(defn meta
-  "The app-supplied data attached to a connection at `connect!` time."
-  [conn]
-  (:meta conn))
+  A hub stores connections and nothing else: add one to a topic, remove it,
+  list a topic's connections. That is what varies between backends -- an atom
+  here, a database elsewhere. Everything about how a connection is built, held
+  open and torn down lives in [[astrolabe.connection]], so a new backend
+  implements three methods and inherits the rest."
+  (:require [astrolabe.connection :as conn]
+            [astrolabe.queue :as queue]
+            [astrolabe.sse :as sse]))
 
 (defprotocol Hub
   (-subscribe!   [hub topic conn])
   (-unsubscribe! [hub topic conn])
   (-conns        [hub topic]))
 
-(defrecord InMemoryHub [!topics interpreter queue-fn drain]
+(defrecord InMemoryHub [!topics]
   Hub
   (-subscribe! [_ topic conn]
     (swap! !topics update topic (fnil conj #{}) conn)
@@ -32,38 +30,30 @@
   (-conns [_ topic]
     (vec (get @!topics topic))))
 
-(defn subscribe!   [hub topic conn] (-subscribe! hub topic conn))
-(defn unsubscribe! [hub topic conn] (-unsubscribe! hub topic conn))
-(defn conns        [hub topic]      (-conns hub topic))
+(defn subscribe!
+  "Register `conn` on `topic`. A connection belongs to exactly one topic --
+  `send!` unsubscribes a refusing connection using its own `:topic` -- so do
+  not use this to put one connection on a second topic."
+  [hub topic conn]
+  (-subscribe! hub topic conn))
 
-(declare default-drain)
+(defn unsubscribe! [hub topic conn] (-unsubscribe! hub topic conn))
+
+(defn conns
+  "The connections currently on `topic`, as a stable snapshot safe to iterate
+  while other threads subscribe and unsubscribe."
+  [hub topic]
+  (-conns hub topic))
 
 (defn in-memory
   "A single-node hub. Connections live in this process and are lost on restart;
   browsers reconnect via Datastar's SSE retry."
-  [{:keys [interpreter queue-fn drain]}]
-  (when (nil? interpreter)
-    (throw (ex-info ":interpreter is required" {})))
-  (->InMemoryHub (atom {})
-                 interpreter
-                 (queue/->queue-fn (or queue-fn :bounded))
-                 (or drain default-drain)))
-
-(defn default-drain
-  "Take frames until the queue closes, writing each one."
-  [_conn q write!]
-  (loop []
-    (when-let [frame (queue/take! q)]
-      (write! frame)
-      (recur))))
-
-(defn frame
-  "Normalize and render `events` once, producing a connection-independent frame."
-  [hub events]
-  (sse/frame (:interpreter hub) events))
+  []
+  (->InMemoryHub (atom {})))
 
 (defn- close-conn!
-  "Unsubscribe a connection and close its queue, ending its drain loop."
+  "Unsubscribe a connection and close its queue, ending its drain loop. The
+  drain's own cleanup closes the generator."
   [hub conn]
   (-unsubscribe! hub (:topic conn) conn)
   (queue/close! (:queue conn))
@@ -79,59 +69,52 @@
     accepted))
 
 (defn broadcast!
-  "Render `events` once and send the resulting frame to every connection on
-  `topic`. Use when every client sees the same HTML."
-  [hub topic events]
-  (let [f (frame hub events)]
-    (doseq [conn (conns hub topic)]
-      (send! hub conn f)))
+  "Send one already-rendered frame to every connection on `topic`. Use when
+  every client sees the same HTML -- render once with `astrolabe.sse/frame`
+  and the same frame reaches everyone."
+  [hub topic frame]
+  (doseq [conn (conns hub topic)]
+    (send! hub conn frame))
   nil)
 
 (defn broadcast-each!
-  "Call `f` with each connection on `topic` and send that connection its own
-  frame. Use when clients see different HTML."
+  "Call `f` with each connection on `topic` and send it the frame `f` returns.
+  Use when clients see different HTML; you pay one render per connection.
+
+  A render that throws for one connection aborts the fan-out -- unlike a dead
+  client, which cannot."
   [hub topic f]
   (doseq [conn (conns hub topic)]
-    (send! hub conn (frame hub (f conn))))
+    (send! hub conn (f conn)))
   nil)
 
 (defn connect!
-  "Return SSE response data that subscribes to `topic`, holds the connection
-  open by draining its queue, and unsubscribes when the client disconnects.
+  "Return SSE response data that spawns a connection with `connector`,
+  registers it on `topic`, drains it until the client disconnects, and cleans
+  up on the way out.
 
-  Disconnect detection lives here. The SDK never throws when a client goes
-  away -- the adapter catches the IOException, closes the generator, and every
-  later write silently returns false -- so `connect!`'s `write!` closes the
-  queue as soon as `sse/apply!` reports a closed connection. That ends the
-  drain loop, and the cleanup below unsubscribes and closes the generator.
-  Cleanup is owned by `connect!`, not by the drain, so a custom `:drain`
-  inherits all of it.
+  This is the glue between a hub and a connection and holds no policy of its
+  own: the queue, the drain loop and disconnect detection all belong to the
+  connector, and storage belongs to the hub.
 
   Opts:
-  - `:meta`         app data attached to the connection, readable with [[meta]]
+  - `:data`         app data attached to the connection, readable with
+                    [[astrolabe.connection/data]]
   - `:on-close`     SDK on-close callback, passed through to the response
   - `:on-exception` SDK on-exception callback, passed through to the response"
-  ([hub topic] (connect! hub topic {}))
-  ([hub topic {m :meta :keys [on-close on-exception]}]
+  ([hub connector topic] (connect! hub connector topic {}))
+  ([hub connector topic {:keys [data on-close on-exception]}]
    (sse/response
     (cond-> {:on-open
              (fn [sse-gen]
-               ;; the queue-fn sees the connection, so build it in two steps
-               (let [proto (->Connection sse-gen nil topic m)
-                     q     ((:queue-fn hub) proto)
-                     conn  (assoc proto :queue q)
-                     write! (fn [frame]
-                              (when-not (sse/apply! (:interpreter hub) sse-gen frame)
-                                ;; the client is gone; end the drain loop
-                                (queue/close! q)))]
-                 (-subscribe! hub topic conn)
+               (let [c (conn/-open connector sse-gen topic data)]
+                 (-subscribe! hub topic c)
                  (try
-                   ((:drain hub) conn q write!)
+                   (conn/-drain! connector c)
                    (catch Exception _
                      nil)   ; a dead client is normal; fall through to cleanup
                    (finally
-                     (-unsubscribe! hub topic conn)
-                     (queue/close! q)
-                     (d*/close-sse! sse-gen)))))}
+                     (-unsubscribe! hub topic c)
+                     (conn/-close! connector c)))))}
       on-close     (assoc :on-close on-close)
       on-exception (assoc :on-exception on-exception)))))

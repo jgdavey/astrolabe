@@ -205,17 +205,21 @@ does so silently. POST and the other methods read the body and are unaffected.
 
 ## Broadcasting
 
-For updates that must reach clients other than the one making the request, use a
-**hub**: a topic-keyed registry of open connections. Create one hub, sharing the
-same interpreter the middleware uses:
+For updates that must reach clients other than the one making the request you
+need two things: a **hub**, a topic-keyed registry of open connections, and a
+**connector**, which knows how to build and run one connection. They are
+separate because only the hub varies — an atom today, a database later — while
+the connection machinery is the same either way.
 
 ```clojure
 (require '[astrolabe.hub :as hub]
+         '[astrolabe.connection :as conn]
          '[astrolabe.sse :as sse])
 
 (def interpreter (sse/interpreter {:render     my-hiccup->html
-                                  :write-json json/write-value-as-string}))
-(def hub         (hub/in-memory {:interpreter interpreter}))
+                                   :write-json json/write-value-as-string}))
+(def hub         (hub/in-memory))
+(def connector   (conn/connector))
 ```
 
 A long-lived connection subscribes to a topic and stays open until the client
@@ -224,7 +228,7 @@ disconnects:
 ```clojure
 ["/boards/:id/sse" {:datastar true
                     :post (fn [{:keys [path-params]}]
-                            (hub/connect! hub (:id path-params)))}]
+                            (hub/connect! hub connector (:id path-params)))}]
 ```
 
 A mutation changes state, broadcasts the specific patch to everyone on the
@@ -235,14 +239,16 @@ topic, and can still reply to the caller on its own stream:
                       :post (fn [{:keys [path-params signals]}]
                               (let [card (cards/create! (:id path-params) signals)]
                                 (hub/broadcast! hub (:id path-params)
-                                                [[:patch-elements (views/card card)
-                                                  {:mode :append :selector "#lane-0"}]])
+                                                (sse/frame interpreter
+                                                           [[:patch-elements (views/card card)
+                                                             {:mode :append :selector "#lane-0"}]]))
                                 (sse/response
                                  {:events [[:patch-signals {:cardTitle ""}]]})))}]
 ```
 
-`broadcast!` accepts the same event data as `sse/response`, so vector sugar and
-canonical maps both work.
+`broadcast!` takes an already-rendered **frame**, not events — `sse/frame`
+accepts the same event data as `sse/response`, so vector sugar and canonical
+maps both work there.
 
 ### Two broadcast paths
 
@@ -250,31 +256,31 @@ Sending to many connections raises a question a single response never does:
 *when does rendering happen?* `astrolabe` surfaces both answers as separate
 functions rather than choosing for you.
 
-A **frame** is the seam. `frame` normalizes event data and runs `:render`,
+A **frame** is the seam. `sse/frame` normalizes event data and runs `:render`,
 producing a payload whose `:elements` are already HTML strings and which depends
-on no particular connection. `send!` writes one frame to one connection.
+on no particular connection. `send!` enqueues one frame for one connection.
 
 ```clojure
-(hub/frame hub events)      ; events → frame  (normalize + render)
-(hub/send! hub conn frame)  ; enqueue one frame for one connection
+(sse/frame interpreter events)  ; events → frame  (normalize + render)
+(hub/send! hub conn frame)      ; enqueue one frame for one connection
 ```
 
 Everything else is those two composed:
 
 | call | renders | use when |
 |------|---------|----------|
-| `(hub/broadcast! hub topic events)` | once, shared by all | every client sees the same HTML |
-| `(hub/broadcast-each! hub topic f)` | once per connection   | clients see different HTML |
+| `(hub/broadcast! hub topic frame)` | once, shared by all | every client sees the same HTML |
+| `(hub/broadcast-each! hub topic f)` | once per connection | clients see different HTML |
 
-`broadcast!` frames once and reuses that frame for every connection, so
-`:render` runs a single time no matter how many clients are listening.
-`broadcast-each!` takes `f`, a function of one connection, and frames its return
-value separately for each — the cost of personalization, paid only when you ask
-for it.
+`broadcast!` takes one frame and hands it to every connection, so `:render` ran
+a single time no matter how many clients are listening. `broadcast-each!` takes
+`f`, a function of one connection returning that connection's own frame — the
+cost of personalization, paid only when you ask for it.
 
-`send!` accepts frames only, never raw events. That's deliberate: allowing
-events there would hide whether a render is shared or per-client at the one call
-site where the distinction costs something. Call `frame` yourself.
+Both take frames, never raw events. That's deliberate: accepting events would
+hide whether a render is shared or per-client at the two call sites where the
+distinction costs something. Render with `sse/frame` yourself, and where it
+sits in your code says which you chose.
 
 `send!` enqueues rather than writes, so neither broadcast blocks on a slow
 client — see [Delivery & concurrency](#delivery--concurrency). A connection
@@ -287,16 +293,17 @@ renders inline, so an exception thrown while rendering for one connection does
 propagate out of `broadcast-each!` and skips the connections after it. If a
 per-connection render can fail, catch inside `f`.
 
-### Connection metadata
+### Connection data
 
 `broadcast-each!` needs something to personalize *on*, so `connect!` takes
-app-supplied metadata that rides along with the connection:
+app-supplied data that rides along with the connection:
 
 ```clojure
-(hub/connect! hub :app {:meta {:uid uid}})
+(hub/connect! hub connector :app {:data {:uid uid}})
 
 (hub/broadcast-each! hub :app
-  (fn [conn] (views/board @!state (:uid (hub/meta conn)))))
+  (fn [conn]
+    (sse/frame interpreter (views/board @!state (:uid (conn/data conn))))))
 ```
 
 `connect!` also accepts `:on-close` and `:on-exception`, passed straight through
@@ -305,21 +312,28 @@ to the SDK adapter as the corresponding callbacks.
 ### Hub API
 
 ```clojure
-(hub/frame           hub events)       ; events → frame (normalize + render)
-(hub/send!           hub conn frame)   ; enqueue one frame for one connection
-(hub/broadcast!      hub topic events) ; render once; send to every conn on topic
-(hub/broadcast-each! hub topic f)      ; f : conn → events; render per connection
+;; the hub: storage, and the glue that uses it
 (hub/subscribe!      hub topic conn)   ; register a connection on a topic
 (hub/unsubscribe!    hub topic conn)
 (hub/conns           hub topic)        ; current connections on topic
-(hub/meta            conn)             ; app data supplied at connect!
-(hub/connect!        hub topic opts?)  ; a datastar response that holds open + (un)subscribes
+(hub/send!           hub conn frame)   ; enqueue one frame for one connection
+(hub/broadcast!      hub topic frame)  ; send one frame to every conn on topic
+(hub/broadcast-each! hub topic f)      ; f : conn → frame; one render per connection
+(hub/connect!        hub connector topic opts?)  ; a datastar response that holds open
+
+;; connections
+(conn/connector      opts?)            ; build the default connector
+(conn/data           conn)             ; app data supplied at connect!
 ```
 
-`connect!` owns the connection lifecycle: it subscribes, drains, and
-unsubscribes. `subscribe!`/`unsubscribe!` are the raw registry operations
-underneath it — reach for them only when you are managing a connection's
-lifetime yourself.
+Only the first three are the `Hub` protocol. `send!`, `broadcast!`,
+`broadcast-each!` and `connect!` are plain functions written against it, so a
+new backend gets them for free.
+
+`connect!` owns the connection lifecycle: it spawns a connection with the
+connector, subscribes it, drains it, and unsubscribes on the way out.
+`subscribe!`/`unsubscribe!` are the raw registry operations underneath it —
+reach for them only when you are managing a connection's lifetime yourself.
 
 A `Connection` belongs to exactly one topic: it carries its `:topic`, and that
 is the topic it is removed from when it has to be closed. Do not use
@@ -329,7 +343,9 @@ broadcast to a topic it is already on.
 
 `in-memory` is single-node: connections live in one process and are lost on
 restart (browsers reconnect via Datastar's SSE retry). The `Hub` protocol is the
-seam for a future multi-node backend (Redis, Postgres `LISTEN`/`NOTIFY`).
+seam for a future backend (Redis, Postgres `LISTEN`/`NOTIFY`) — three methods
+over whatever storage you like. Everything about running a connection lives
+behind [`Connector`](#the-connector) instead, so a new hub inherits it.
 
 ## State-based recipe
 
@@ -346,19 +362,21 @@ primitives above:
 ```clojure
 (defonce !state (atom initial))
 
+(def hub (hub/in-memory))
+
+;; A state-based connector coalesces: a superseded snapshot is worthless.
+(def connector (conn/connector {:queue-fn :latest}))
+
 ;; Each connection carries the user it belongs to. Nothing else to track.
 ["/app/sse" {:datastar true
              :post (fn [{:keys [uid]}]
-                     (hub/connect! hub :app {:meta {:uid uid}}))}]
+                     (hub/connect! hub connector :app {:data {:uid uid}}))}]
 
 ;; Mutations just move state; they do NOT broadcast.
 ["/app/toggle/:id" {:datastar true
                     :post (fn [{:keys [path-params]}]
                             (swap! !state toggle (:id path-params))
                             {:status 204})}]
-
-;; A state-based hub coalesces: a superseded snapshot is worthless.
-(def hub (hub/in-memory {:interpreter interpreter :queue-fn :latest}))
 
 ;; One ticker re-renders current state for every connection, ~10x/sec.
 (defonce ticker
@@ -367,18 +385,20 @@ primitives above:
              (let [state @!state]
                (hub/broadcast-each! hub :app
                                     (fn [conn]
-                                      (views/app state (:uid (hub/meta conn))))))
+                                      (sse/frame interpreter
+                                                 (views/app state (:uid (conn/data conn)))))))
              (Thread/sleep 100)
              (recur))))
 ```
 
 This uses `broadcast-each!` because each user sees their own view. If every
-client would see identical HTML, `broadcast!` renders once per tick instead of
-once per client — a difference you feel at a few hundred connections.
+client would see identical HTML, render once per tick with `sse/frame` and pass
+that one frame to `broadcast!` instead — a difference you feel at a few hundred
+connections.
 
 The two refinements production state-based apps want are both delivery concerns,
-so neither is app code: dropping frames for slow clients is `:queue-fn :latest`
-above, and deduping unchanged renders is a
+so neither is app code: both are connector configuration. Dropping frames for
+slow clients is `:queue-fn :latest` above; deduping unchanged renders is a
 [custom drain loop](#the-drain-loop). Both are covered under
 [Delivery & concurrency](#delivery--concurrency).
 
@@ -472,18 +492,24 @@ Hold-open and delivery are the same loop. `connect!` subscribes, then drains
 until the client disconnects:
 
 ```clojure
-;; connect!, in essence
-(let [write! (fn [frame]
-               ;; a write reporting a closed connection ends the drain loop
-               (when-not (sse/apply! interpreter sse-gen frame)
-                 (queue/close! queue)))]
+;; connect!, in essence: spawn, register, drain, tear down
+(let [conn (conn/-open connector sse-gen topic data)]
   (subscribe! hub topic conn)
   (try
-    (drain conn queue write!)   ; blocks until the queue closes
+    (conn/-drain! connector conn)   ; blocks until the queue closes
+    (catch Exception _ nil)         ; a dead client is normal
     (finally
       (unsubscribe! hub topic conn)
-      (queue/close! queue)
-      (d*/close-sse! sse-gen))))
+      (conn/-close! connector conn))))
+```
+
+The connector supplies the `write!` its drain uses, and that is where a
+disconnect is noticed:
+
+```clojure
+(fn [frame]
+  (when-not (sse/apply! sse-gen frame)
+    (queue/close! queue)))   ; ends the drain, so connect!'s cleanup runs
 ```
 
 A disconnected client is detected on the write, not by an exception: the SDK's
@@ -550,36 +576,48 @@ reconnects and a fresh connection re-renders current state. State-based frames
 are complete snapshots, so a superseded frame is worthless and coalescing is
 strictly better than buffering.
 
-### Configuring the hub
+### The connector
 
-`:queue-fn` and `:drain` live on the hub, so every connection on it shares one
-delivery policy. Both receive the connection, which carries `:topic` and
-`:meta`, so policy can still vary where that's meaningful:
+A **connector** spawns connections: it builds the queue, runs the drain loop,
+notices the client leaving, and tears the connection down. It is separate from
+the hub on purpose — a hub stores connections, and how it stores them is what
+varies between an atom and a database. None of the machinery here does.
 
 ```clojure
-(def hub
-  (hub/in-memory
-   {:interpreter interpreter
-    :queue-fn    :bounded}))       ; keyword sugar for (fn [_] (queue/bounded 64))
+(defprotocol Connector
+  (-open   [connector sse-gen topic data])   ; build a Connection with its queue
+  (-drain! [connector conn])                 ; block until the queue closes
+  (-close! [connector conn]))                ; close the queue, then the generator
 ```
 
+You rarely implement it. The default connector takes the two things worth
+varying as plain configuration:
+
 ```clojure
-;; varying by topic, when one hub serves both models
+(def connector (conn/connector {:queue-fn :bounded}))   ; the default
+```
+
+`:queue-fn` accepts a keyword (`:bounded` `:latest` `:unbounded`, at their
+defaults) or a function of `{:topic :data}` returning a queue. It is called once
+per connection, so policy can vary where that's meaningful:
+
+```clojure
+;; varying by topic, when one connector serves both models
 {:queue-fn (fn [{:keys [topic]}]
              (if (= topic :app)
                (queue/latest)
                (queue/bounded 64)))}
 ```
 
-`:queue-fn` accepts a keyword (`:bounded` `:latest` `:unbounded`, at their
-defaults) or a function of one connection returning a queue. It is called once
-per connection.
+Implement `Connector` yourself only to replace the machinery wholesale — to
+instrument every connection, say. `connect!` reaches for nothing beyond these
+three methods, so any implementation drops straight in.
 
 ### The drain loop
 
-`:drain` is a function of `[conn q write!]`. The default takes frames and writes
-them until the queue closes. Replacing it is how you get behavior the library
-doesn't ship — dedupe, for instance, is three lines:
+`:drain` is a function of `[conn q write!]` on the connector. The default takes
+frames and writes them until the queue closes. Replacing it is how you get
+behavior the library doesn't ship — dedupe, for instance, is three lines:
 
 ```clojure
 {:drain (fn [_conn q write!]
@@ -594,13 +632,13 @@ everything pending, write once — is the other natural one.
 
 A custom drain loop does **not** have to own cleanup. The `try`/`finally` lives
 in `connect!`, outside the drain, so whatever drain you supply, `connect!`
-unsubscribes the connection, closes its queue and closes the SSE generator once
-the drain returns or throws. `default-drain` itself contains no error handling
-at all.
+unsubscribes the connection and calls the connector's `-close!` — closing the
+queue and the SSE generator — once the drain returns or throws. `default-drain`
+itself contains no error handling at all.
 
-Disconnect detection is likewise `connect!`'s: the `write!` it hands your drain
-closes the queue as soon as a write reports the connection closed, which ends
-your `take!` loop the same way an explicit `close!` would. The SDK never throws
+Disconnect detection is likewise not yours: the `write!` the connector hands
+your drain closes the queue as soon as a write reports the connection closed,
+which ends your `take!` loop the same way an explicit `close!` would. The SDK never throws
 on an ordinary disconnect — its adapters catch the IOException and report the
 closure as a `false` return from the next write — so a drain that tries to
 detect a dead client by catching exceptions will not see one.

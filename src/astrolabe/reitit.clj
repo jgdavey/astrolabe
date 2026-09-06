@@ -43,9 +43,9 @@
   (or on-open
       (fn [sse-gen]
         (if (false? auto-close?)
-          (sse/apply! interpreter sse-gen (sse/frame interpreter events))
+          (sse/apply! sse-gen (sse/frame interpreter events))
           (d*/with-open-sse sse-gen
-            (sse/apply! interpreter sse-gen (sse/frame interpreter events)))))))
+            (sse/apply! sse-gen (sse/frame interpreter events)))))))
 
 (defn- ->response
   [{:keys [->sse-response interpreter compression]} req resp]

@@ -56,7 +56,7 @@
 
 (deftest apply!-writes-events-to-the-generator
   (let [gen (adapter.test/->sse-recorder)]
-    (sse/apply! itp gen (sse/frame itp [[:patch-elements [:div "hi"] {:mode :append}]
+    (sse/apply! gen (sse/frame itp [[:patch-elements [:div "hi"] {:mode :append}]
                                         [:patch-signals {:name ""}]]))
     (let [events @(:!rec gen)]
       (is (= 2 (count events)))
@@ -81,17 +81,17 @@
                           [:remove-element "#b"]
                           [:remove-element "#c"]])]
     (testing "an open connection"
-      (is (true? (sse/apply! itp (->counting-gen (atom 0) 3) f))))
+      (is (true? (sse/apply! (->counting-gen (atom 0) 3) f))))
 
     (testing "a closed connection"
       (let [!writes (atom 0)]
-        (is (false? (sse/apply! itp (->counting-gen !writes 0) f)))
+        (is (false? (sse/apply! (->counting-gen !writes 0) f)))
         (is (= 3 @!writes)
             "every event is still attempted; only the verdict changes")))
 
     (testing "a connection that closes mid-frame"
       (let [!writes (atom 0)]
-        (is (false? (sse/apply! itp (->counting-gen !writes 1) f)))
+        (is (false? (sse/apply! (->counting-gen !writes 1) f)))
         (is (= 3 @!writes))))))
 
 (deftest response-tags-data-for-the-middleware

@@ -62,7 +62,7 @@
   only signal a caller gets that a client has gone away: the SDK's adapters
   catch the disconnect internally and report it as a `false` return, never as
   an exception."
-  [_itp sse-gen frame]
+  [sse-gen frame]
   (reduce (fn [ok ev] (if (write-one! sse-gen ev) ok false)) true frame))
 
 (defn response
