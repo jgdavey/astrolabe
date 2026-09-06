@@ -81,6 +81,10 @@ with `:datastar true`.
 (defn- read-json [s]
   (json/read-value s json/keyword-keys-object-mapper))
 
+(def interpreter
+  (sse/interpreter {:render     my-hiccup->html
+                    :write-json json/write-value-as-string}))
+
 (def router
   (ring/router
    [["/greet" {:datastar true
@@ -91,17 +95,21 @@ with `:datastar true`.
    {:data {:middleware [(astrolabe/middleware
                           {:->sse-response adapter.ring/->sse-response
                            :parse-json     read-json
-                           :render         my-hiccup->html})]}}))
+                           :interpreter    interpreter})]}}))
 ```
 
 Three things to note:
 
 - The handler **returns data** (`sse/response`), not side effects. The
   middleware turns that value into a streaming SSE response.
-- `:render` is your hiccup-to-HTML function (see [Rendering](#rendering)).
-  It's injected, never a global.
-- `:parse-json` is yours — the SDK stays JSON-library-agnostic and so does
-  `astrolabe`.
+- An **interpreter** carries everything needed to turn event data into bytes:
+  `:render` (see [Rendering](#rendering)) and `:write-json`. Build one and share
+  it between the middleware and any hubs, so rendering is configured once.
+- JSON is yours in both directions — the SDK is library-agnostic and so is
+  `astrolabe`. `:parse-json` reads signals off the request; `:write-json`
+  serializes `:patch-signals` maps. A `:patch-signals` value that is already a
+  string passes through untouched, so `:write-json` is only required if you use
+  the map form.
 
 Incoming Datastar signals are parsed onto `:signals` on the request for any
 route flagged `:datastar true`.
@@ -158,13 +166,16 @@ missing primary arg throws.
 |-----------------------|-------------|----------------------------|-------------|
 | `:patch-elements`     | `:elements` | hiccup or HTML string      | `:selector` `:mode` `:use-view-transition?` `:retry-duration` `:element-ns` |
 | `:patch-elements-seq` | `:elements` | seq of the above           | (as above) |
-| `:patch-signals`      | `:signals`  | a map (serialized to JSON) | `:only-if-missing?` |
+| `:patch-signals`      | `:signals`  | a map, or a JSON string    | `:only-if-missing?` |
 | `:remove-element`     | `:selector` | CSS selector string        | |
 | `:execute-script`     | `:script`   | JavaScript string          | `:auto-remove?` `:attributes` |
 
 `:mode` accepts friendly keywords — `:outer` `:inner` `:append` `:prepend`
 `:before` `:after` `:remove` `:replace` — mapped onto the SDK's patch-mode
-constants for you.
+constants for you. Every op also accepts `:id` (the SSE event id).
+
+A `:patch-signals` map is serialized with the interpreter's `:write-json`; a
+string is sent as-is. Passing a map with no `:write-json` configured throws.
 
 ## Reading signals
 
@@ -188,8 +199,9 @@ same interpreter the middleware uses:
 (require '[astrolabe.hub :as hub]
          '[astrolabe.sse :as sse])
 
-(def apply! (sse/interpreter {:render my-hiccup->html}))
-(def hub    (hub/in-memory {:apply! apply!}))
+(def interpreter (sse/interpreter {:render     my-hiccup->html
+                                  :write-json json/write-value-as-string}))
+(def hub         (hub/in-memory {:interpreter interpreter}))
 ```
 
 A long-lived connection subscribes to a topic and stays open until the client
@@ -312,7 +324,7 @@ primitives above:
                             {:status 204})}]
 
 ;; A state-based hub coalesces: a superseded snapshot is worthless.
-(def hub (hub/in-memory {:apply! apply! :queue-fn :latest}))
+(def hub (hub/in-memory {:interpreter interpreter :queue-fn :latest}))
 
 ;; One ticker re-renders current state for every connection, ~10x/sec.
 (defonce ticker
@@ -376,7 +388,7 @@ trigger the same load. You require it, you pass the profile:
 (astrolabe/middleware
  {:->sse-response adapter.ring/->sse-response
   :parse-json     read-json
-  :render         my-hiccup->html
+  :interpreter    interpreter
   :compression    [["br"   (astrolabe.brotli/profile)]
                    ["gzip" common/gzip-profile]]})
 ```
@@ -496,8 +508,8 @@ delivery policy. Both receive the connection, which carries `:topic` and
 ```clojure
 (def hub
   (hub/in-memory
-   {:apply!   apply!
-    :queue-fn :bounded}))          ; keyword sugar for (fn [_] (queue/bounded 64))
+   {:interpreter interpreter
+    :queue-fn    :bounded}))       ; keyword sugar for (fn [_] (queue/bounded 64))
 ```
 
 ```clojure
