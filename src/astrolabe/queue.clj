@@ -1,8 +1,7 @@
 (ns astrolabe.queue
   "Per-connection frame queues. Overflow policy is `offer!`'s return value:
   a queue that returns false is asking for its connection to be closed."
-  (:import [java.util.concurrent LinkedBlockingQueue]
-           [java.util.concurrent.locks ReentrantLock Condition]))
+  (:import [java.util.concurrent LinkedBlockingQueue ArrayBlockingQueue]))
 
 (defprotocol Queue
   (offer! [q frame]
@@ -16,14 +15,17 @@
 
 (deftype BlockingFrameQueue [^LinkedBlockingQueue q ^:volatile-mutable closed?]
   Queue
-  (offer! [_ frame] (if closed? false (.offer q frame)))
-  (take!  [_] (let [v (.take q)]
-                (if (identical? v CLOSED)
-                  ;; put the sentinel back so any other taker also sees the
-                  ;; close; same retry as `close!`, since a full queue would
-                  ;; otherwise swallow it
-                  (do (while (not (.offer q CLOSED)) (.poll q)) nil)
-                  v)))
+  (offer! [_ frame]
+    (if closed?
+      false
+      (.offer q frame)))
+  (take! [_]
+    (let [v (.take q)]
+      (if (identical? v CLOSED)
+        ;; Put the sentinel back on the queue in case of other readers
+        (do (while (not (.offer q CLOSED)) (.poll q))
+            nil)
+        v)))
   (close! [_]
     (set! closed? true)
     (.clear q)
@@ -42,46 +44,34 @@
   []
   (->BlockingFrameQueue (LinkedBlockingQueue.) false))
 
-(deftype LatestFrameQueue [^ReentrantLock lock
-                           ^Condition ready
-                           ^:volatile-mutable slot
-                           ^:volatile-mutable closed?]
+(deftype SlidingFrameQueue [^ArrayBlockingQueue q ^:volatile-mutable closed?]
   Queue
   (offer! [_ frame]
-    (.lock lock)
-    (try
-      (when-not closed?
-        (set! slot frame)
-        (.signalAll ready))
-      true
-      (finally (.unlock lock))))
-
+    (if closed?
+      false
+      (do
+        (while (not (.offer q frame))
+          ;; drop head of queue until there's room
+          (.poll q))
+        true)))
   (take! [_]
-    (.lock lock)
-    (try
-      (loop []
-        (cond
-          (some? slot) (let [v slot] (set! slot nil) v)
-          closed?      nil
-          :else        (do (.await ready) (recur))))
-      (finally (.unlock lock))))
-
+    (let [v (.take q)]
+      (if (identical? v CLOSED)
+        ;; Put the sentinel back on the queue in case of other readers
+        (do (while (not (.offer q CLOSED)) (.poll q))
+            nil)
+        v)))
   (close! [_]
-    (.lock lock)
-    (try
-      (set! closed? true)
-      (set! slot nil)
-      (.signalAll ready)
-      nil
-      (finally (.unlock lock)))))
+    (set! closed? true)
+    (.clear q)
+    (while (not (.offer q CLOSED)) (.poll q))
+    nil))
 
-(defn latest
-  "A depth-1 queue where a newer frame replaces the pending one. Never refuses.
-  Use for state-based topics, where each frame is a complete snapshot and a
-  superseded one is worthless."
-  []
-  (let [lock (ReentrantLock.)]
-    (->LatestFrameQueue lock (.newCondition lock) nil false)))
+(defn sliding [n]
+  (->SlidingFrameQueue (ArrayBlockingQueue. n) false))
+
+(defn latest []
+  (sliding 1))
 
 (def ^:private built-ins
   {:bounded   #(bounded 64)
