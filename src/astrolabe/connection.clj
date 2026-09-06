@@ -36,22 +36,54 @@
       (write! frame)
       (recur))))
 
-(defrecord DefaultConnector [queue-fn drain]
+(defn- start-heartbeat!
+  "Offer a keepalive frame whenever the connection has gone `ms` without a write.
+
+  Runs on its own virtual thread and only ever touches the queue -- the drain
+  thread stays the sole writer to the generator, so no locking is involved.
+  Because it fires only when idle, the queue is empty whenever it offers: a
+  keepalive can never evict a pending frame from a coalescing queue, nor add
+  work to a connection that is already writing.
+
+  The loop ends when the queue refuses the frame, which is what a closed queue
+  does, so it also winds itself up if it is never interrupted."
+  [q !last-write ^long ms]
+  (Thread/startVirtualThread
+   (fn []
+     (try
+       (loop []
+         (Thread/sleep ms)
+         (let [idle-ms (quot (- (System/nanoTime) ^long @!last-write) 1000000)]
+           (if (< idle-ms ms)
+             (recur)
+             (when (queue/offer! q sse/heartbeat-frame)
+               (recur)))))
+       (catch InterruptedException _ nil)))))
+
+(defrecord DefaultConnector [queue-fn drain heartbeat-ms]
   Connector
   (-open [_ sse-gen topic data]
     (->Connection sse-gen (queue-fn {:topic topic :data data}) topic data))
 
   (-drain! [_ conn]
     (let [{:keys [sse-gen queue]} conn
+          !last-write (atom (System/nanoTime))
           write! (fn [frame]
+                   (reset! !last-write (System/nanoTime))
                    (when-not (sse/apply! sse-gen frame)
                      ;; The client is gone. The SDK never throws for this -- the
                      ;; adapter catches the IOException, closes the generator,
                      ;; and every later write silently returns false -- so this
                      ;; verdict is the only signal we get. Closing the queue
                      ;; ends the drain, which lets the caller clean up.
-                     (queue/close! queue)))]
-      (drain conn queue write!)))
+                     (queue/close! queue)))
+          ;; Started here rather than in -open so it brackets whatever `drain`
+          ;; is configured: a custom drain loop cannot silently lose keepalives.
+          hb (when heartbeat-ms (start-heartbeat! queue !last-write heartbeat-ms))]
+      (try
+        (drain conn queue write!)
+        (finally
+          (when hb (.interrupt ^Thread hb))))))
 
   (-close! [_ conn]
     (queue/close! (:queue conn))
@@ -64,8 +96,14 @@
   - `:queue-fn` a keyword (`:bounded` `:latest` `:unbounded`) or a function of
     `{:topic :data}` returning a queue; defaults to `:bounded`
   - `:drain` `(fn [conn queue write!])` that blocks until the queue closes;
-    defaults to [[default-drain]]"
+    defaults to [[default-drain]]
+  - `:heartbeat-ms` milliseconds of write inactivity after which a no-op
+    keepalive frame is queued. Off by default -- when absent, no keepalive
+    thread is started and a connection costs exactly what it always did. Turn
+    it on for topics that can be idle for long stretches, where nothing else
+    would ever attempt the write that reveals a client is gone."
   ([] (connector {}))
-  ([{:keys [queue-fn drain]}]
+  ([{:keys [queue-fn drain heartbeat-ms]}]
    (->DefaultConnector (queue/->queue-fn (or queue-fn :bounded))
-                       (or drain default-drain))))
+                       (or drain default-drain)
+                       heartbeat-ms)))

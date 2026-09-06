@@ -41,6 +41,19 @@
   [itp events]
   (mapv #(render-event itp (event/normalize %)) events))
 
+(def heartbeat-frame
+  "A pre-rendered frame that patches an empty map of signals.
+
+  Datastar merges `{}` into its signals, so this changes nothing on the client.
+  Its only job is to make the server attempt a write, which is the only way to
+  notice a client that went away without closing the connection -- and to keep
+  an idle connection from being reaped by an intermediary. The SDK exposes no
+  SSE-comment primitive, so a no-op event is the cheapest keepalive available.
+
+  Already rendered -- the signals are a JSON string -- so it needs no
+  interpreter and can be built by machinery that has none."
+  [{:op :patch-signals :signals "{}"}])
+
 (defn- write-one!
   "Write one canonical event to an SDK sse-gen, returning the SDK's own boolean:
   `false` if the connection is closed, `true` otherwise."

@@ -306,8 +306,41 @@ app-supplied data that rides along with the connection:
     (sse/frame interpreter (views/board @!state (:uid (conn/data conn))))))
 ```
 
-`connect!` also accepts `:on-close` and `:on-exception`, passed straight through
-to the SDK adapter as the corresponding callbacks.
+### Connection lifecycle hooks
+
+An event-based topic has one thing a mutation handler doesn't: the client that
+just connected has an empty screen. `:on-connect` is where you fill it.
+
+```clojure
+(hub/connect! hub connector board-id
+  {:data          {:uid uid}
+   :on-connect    (fn [conn]
+                    (hub/send! hub conn
+                               (sse/frame interpreter (views/board (boards/fetch board-id)))))
+   :on-disconnect (fn [conn] (presence/left! board-id (:uid (conn/data conn))))})
+```
+
+Both hooks receive the `Connection`, so `conn/data` is available to them.
+
+`:on-connect` runs after the connection is subscribed and before the drain
+starts. Subscribing first is what makes the initial render safe: a broadcast
+arriving mid-render is queued *behind* it rather than lost, so a client cannot
+miss an update by connecting at the wrong moment. It runs on the thread holding
+the connection open, so it should return promptly — enqueue the render, don't
+block on a slow query.
+
+Unlike a dead client, an exception from `:on-connect` is **not** swallowed: the
+connection is torn down as usual and the exception reaches the adapter, and so
+your `:on-exception`. A failed initial render is an application bug, not a
+routine disconnect, and silently serving a blank screen would hide it.
+
+`:on-disconnect` runs last, after the connection has been unsubscribed and its
+generator closed — the place for presence bookkeeping, not for a farewell
+message the client will never receive.
+
+These are distinct from `:on-close` and `:on-exception`, which `connect!` passes
+straight through to the SDK adapter and which see the raw `sse-gen` rather than
+the `Connection`.
 
 ### Hub API
 
@@ -316,24 +349,58 @@ to the SDK adapter as the corresponding callbacks.
 (hub/subscribe!      hub topic conn)   ; register a connection on a topic
 (hub/unsubscribe!    hub topic conn)
 (hub/conns           hub topic)        ; current connections on topic
+(hub/topics          hub)              ; topics currently holding a connection
 (hub/send!           hub conn frame)   ; enqueue one frame for one connection
 (hub/broadcast!      hub topic frame)  ; send one frame to every conn on topic
 (hub/broadcast-each! hub topic f)      ; f : conn → frame; one render per connection
 (hub/connect!        hub connector topic opts?)  ; a datastar response that holds open
+(hub/disconnect!     hub conn)         ; drop one connection
+(hub/shutdown!       hub)              ; drop every connection on every topic
 
 ;; connections
 (conn/connector      opts?)            ; build the default connector
 (conn/data           conn)             ; app data supplied at connect!
 ```
 
-Only the first three are the `Hub` protocol. `send!`, `broadcast!`,
-`broadcast-each!` and `connect!` are plain functions written against it, so a
-new backend gets them for free.
+Only the first four are the `Hub` protocol. Everything else is a plain function
+written against it, so a new backend gets them for free.
 
 `connect!` owns the connection lifecycle: it spawns a connection with the
 connector, subscribes it, drains it, and unsubscribes on the way out.
 `subscribe!`/`unsubscribe!` are the raw registry operations underneath it —
 reach for them only when you are managing a connection's lifetime yourself.
+
+### Inspecting and dropping connections
+
+`conns` plus `data` is enough to answer questions about who is listening —
+there's no separate query API because there doesn't need to be:
+
+```clojure
+(defn connected-user-ids [hub topic]
+  (into #{} (map (comp :uid conn/data)) (hub/conns hub topic)))
+```
+
+`disconnect!` drops a single connection and `shutdown!` drops all of them.
+Neither closes the SSE generator directly: they close the connection's queue,
+which ends its drain, which lets the `connect!` holding that connection open
+run its own cleanup. That is the same path a client disconnect takes, so there
+is only one teardown to reason about.
+
+`shutdown!` is what you want on server stop, so held connections are released
+rather than left blocking their threads until the process dies:
+
+```clojure
+;; with mount
+(defstate connections
+  :start (hub/in-memory)
+  :stop  (hub/shutdown! connections))
+
+;; with integrant
+(defmethod ig/halt-key! ::hub [_ hub] (hub/shutdown! hub))
+```
+
+Clients reconnect on their own via Datastar's SSE retry, so a restart
+resynchronizes without any missed-event bookkeeping.
 
 A `Connection` belongs to exactly one topic: it carries its `:topic`, and that
 is the topic it is removed from when it has to be closed. Do not use
@@ -343,7 +410,7 @@ broadcast to a topic it is already on.
 
 `in-memory` is single-node: connections live in one process and are lost on
 restart (browsers reconnect via Datastar's SSE retry). The `Hub` protocol is the
-seam for a future backend (Redis, Postgres `LISTEN`/`NOTIFY`) — three methods
+seam for a future backend (Redis, Postgres `LISTEN`/`NOTIFY`) — four methods
 over whatever storage you like. Everything about running a connection lives
 behind [`Connector`](#the-connector) instead, so a new hub inherits it.
 
@@ -496,18 +563,26 @@ until the client disconnects:
 (let [conn (conn/-open connector sse-gen topic data)]
   (subscribe! hub topic conn)
   (try
-    (conn/-drain! connector conn)   ; blocks until the queue closes
-    (catch Exception _ nil)         ; a dead client is normal
+    (when on-connect (on-connect conn))   ; initial render, exceptions not swallowed
+    (try
+      (conn/-drain! connector conn)       ; blocks until the queue closes
+      (catch Exception _ nil))            ; a dead client is normal
     (finally
       (unsubscribe! hub topic conn)
-      (conn/-close! connector conn))))
+      (conn/-close! connector conn)
+      (when on-disconnect (on-disconnect conn)))))
 ```
+
+The two `try`s are the difference between a routine disconnect and a bug: the
+inner one swallows drain exceptions because a client going away is normal, while
+an `:on-connect` that throws propagates once cleanup has run.
 
 The connector supplies the `write!` its drain uses, and that is where a
 disconnect is noticed:
 
 ```clojure
 (fn [frame]
+  (reset! !last-write (System/nanoTime))   ; for the heartbeat, when enabled
   (when-not (sse/apply! sse-gen frame)
     (queue/close! queue)))   ; ends the drain, so connect!'s cleanup runs
 ```
@@ -590,8 +665,8 @@ varies between an atom and a database. None of the machinery here does.
   (-close! [connector conn]))                ; close the queue, then the generator
 ```
 
-You rarely implement it. The default connector takes the two things worth
-varying as plain configuration:
+You rarely implement it. The default connector takes the things worth varying
+as plain configuration:
 
 ```clojure
 (def connector (conn/connector {:queue-fn :bounded}))   ; the default
@@ -612,6 +687,44 @@ per connection, so policy can vary where that's meaningful:
 Implement `Connector` yourself only to replace the machinery wholesale — to
 instrument every connection, say. `connect!` reaches for nothing beyond these
 three methods, so any implementation drops straight in.
+
+### Heartbeats
+
+A client can go away without saying so — a laptop lid closes, a NAT table
+forgets the mapping, a proxy reaps an idle stream. The SDK reports a dead
+connection only as a `false` return from a write, so on a topic with no traffic
+nothing ever asks the question, and the connection sits in the registry
+indefinitely holding its thread.
+
+`:heartbeat-ms` fixes that by making the server write something:
+
+```clojure
+(def connector (conn/connector {:heartbeat-ms 30000}))
+```
+
+It is **off by default** — when absent no keepalive thread is started, and a
+connection costs exactly what it otherwise would. Turn it on for topics that can
+be idle for long stretches. The [state-based recipe](#state-based-recipe) has a
+ticker writing many times a second and needs none of this.
+
+The keepalive is an empty `:patch-signals` frame, which Datastar merges into its
+signals as a no-op. The SDK exposes no SSE-comment primitive, so a no-op event is
+the cheapest keepalive available; over a streaming-compressed connection it costs
+almost nothing on the wire.
+
+Two properties are worth knowing, because they are what make it safe to leave on:
+
+- **It only fires when idle.** The timer measures time since the last *write*, so
+  a connection that is already sending gets no keepalives. It also means the
+  queue is empty whenever a keepalive is offered, so it can never evict a pending
+  frame from a `:latest` queue.
+- **It never writes.** The keepalive thread only offers to the queue; the drain
+  thread remains the sole writer to the generator. So detection follows the
+  ordinary path — the drain writes the keepalive, gets `false`, closes the queue,
+  and `connect!` unsubscribes the connection like any other disconnect.
+
+Because it is started by `-drain!` around whatever `:drain` you configure, a
+[custom drain loop](#the-drain-loop) does not silently lose heartbeats.
 
 ### The drain loop
 

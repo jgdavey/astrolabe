@@ -109,3 +109,100 @@
     (conn/-close! c conn)
     (is (false? (queue/offer! (:queue conn) :frame)) "the queue is closed")
     (is (true? @(:!closed? gen)) "the SSE generator is closed")))
+
+;; -----------------------------------------------------------------------------
+;; Heartbeat
+
+(defn- heartbeat? [s] (re-find #"datastar-patch-signals" s))
+
+(defn- drain-on-thread
+  "Run `-drain!` on its own virtual thread, returning a promise of its return."
+  [c conn]
+  (let [done (promise)]
+    (Thread/startVirtualThread #(do (conn/-drain! c conn) (deliver done true)))
+    done))
+
+(deftest heartbeat-is-off-unless-asked-for
+  (let [c    (conn/connector {:queue-fn (fn [_] (queue/unbounded))})
+        gen  (adapter.test/->sse-recorder)
+        conn (conn/-open c gen :room nil)
+        done (drain-on-thread c conn)]
+    (Thread/sleep 300)
+    (is (= [] @(:!rec gen))
+        "no :heartbeat-ms means no keepalive thread and no traffic at all")
+    (queue/close! (:queue conn))
+    (is (true? (deref done 2000 ::timeout)))))
+
+(deftest an-idle-connection-is-heartbeaten
+  (let [c    (conn/connector {:queue-fn    (fn [_] (queue/unbounded))
+                              :heartbeat-ms 50})
+        gen  (adapter.test/->sse-recorder)
+        conn (conn/-open c gen :room nil)
+        done (drain-on-thread c conn)]
+    (is (wait-for #(seq @(:!rec gen))) "an idle connection gets a keepalive write")
+    (is (heartbeat? (first @(:!rec gen)))
+        "the keepalive is an empty signals patch -- a no-op on the client")
+    (queue/close! (:queue conn))
+    (is (true? (deref done 2000 ::timeout)))))
+
+(deftest a-busy-connection-is-not-heartbeaten
+  (let [c    (conn/connector {:queue-fn    (fn [_] (queue/unbounded))
+                              :heartbeat-ms 100})
+        gen  (adapter.test/->sse-recorder)
+        conn (conn/-open c gen :room nil)
+        done (drain-on-thread c conn)]
+    ;; keep real frames flowing for well over the heartbeat interval
+    (dotimes [_ 30]
+      (queue/offer! (:queue conn) (a-frame))
+      (Thread/sleep 10))
+    (Thread/sleep 20)
+    (is (seq @(:!rec gen)) "the real frames were written")
+    (is (not-any? heartbeat? @(:!rec gen))
+        "a connection that is already writing needs no keepalive")
+    (queue/close! (:queue conn))
+    (is (true? (deref done 2000 ::timeout)))))
+
+(deftest a-heartbeat-detects-a-client-that-went-away-silently
+  ;; The whole point: with no application traffic, nothing else would ever
+  ;; attempt a write, so a half-open connection would sit in the registry
+  ;; forever. The keepalive is what turns it into a false write verdict.
+  (let [c    (conn/connector {:queue-fn    (fn [_] (queue/unbounded))
+                              :heartbeat-ms 50})
+        gen  (->failing-gen 0)
+        conn (conn/-open c gen :room nil)
+        done (drain-on-thread c conn)]
+    (is (true? (deref done 3000 ::timeout))
+        "the keepalive write reports the connection closed, which ends the drain")
+    (is (pos? @(:!writes gen)) "a write was actually attempted")))
+
+(deftest the-heartbeat-outlives-a-custom-drain-loop
+  ;; The keepalive is started by -drain! around whatever drain is configured,
+  ;; so replacing the drain does not silently disable it.
+  (let [c    (conn/connector {:queue-fn    (fn [_] (queue/unbounded))
+                              :heartbeat-ms 50
+                              :drain       (fn [_conn q write!]
+                                             (loop []
+                                               (when-let [f (queue/take! q)]
+                                                 (write! f)
+                                                 (recur))))})
+        gen  (adapter.test/->sse-recorder)
+        conn (conn/-open c gen :room nil)
+        done (drain-on-thread c conn)]
+    (is (wait-for #(some heartbeat? @(:!rec gen)))
+        "a custom drain still gets keepalives")
+    (queue/close! (:queue conn))
+    (is (true? (deref done 2000 ::timeout)))))
+
+(deftest the-heartbeat-stops-when-the-drain-ends
+  (let [c    (conn/connector {:queue-fn    (fn [_] (queue/unbounded))
+                              :heartbeat-ms 50})
+        gen  (adapter.test/->sse-recorder)
+        conn (conn/-open c gen :room nil)
+        done (drain-on-thread c conn)]
+    (is (wait-for #(seq @(:!rec gen))))
+    (queue/close! (:queue conn))
+    (is (true? (deref done 2000 ::timeout)))
+    (let [n @(:!rec gen)]
+      (Thread/sleep 200)
+      (is (= (count n) (count @(:!rec gen)))
+          "no keepalive thread is left running after the connection ends"))))

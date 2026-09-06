@@ -269,3 +269,151 @@
     (is (true? (deref done 2000 ::timeout)) "the drain loop ended")
     (is (= 3 @(:!writes gen))
         "a failing write does not skip the rest of the frame")))
+
+;; -----------------------------------------------------------------------------
+;; Topics, disconnect! and shutdown!
+
+(deftest topics-lists-only-topics-holding-connections
+  (let [h (hub/in-memory)
+        a (test-conn :one)
+        b (test-conn :two)]
+    (is (= #{} (set (hub/topics h))) "a fresh hub has no topics")
+
+    (hub/subscribe! h :one a)
+    (hub/subscribe! h :two b)
+    (is (= #{:one :two} (set (hub/topics h))))
+
+    (hub/unsubscribe! h :one a)
+    (is (= #{:two} (set (hub/topics h)))
+        "an emptied topic is gone, not left behind as an empty entry")))
+
+(deftest disconnect!-unsubscribes-and-closes-the-queue
+  (let [h (hub/in-memory)
+        a (test-conn :room)
+        b (test-conn :room)]
+    (doseq [c [a b]] (hub/subscribe! h :room c))
+
+    (hub/disconnect! h a)
+
+    (is (= [b] (hub/conns h :room)) "only the named connection leaves the topic")
+    (is (false? (queue/offer! (:queue a) :frame))
+        "its queue is closed, which ends whatever drain loop is holding it")
+    (is (true? (queue/offer! (:queue b) :frame)) "the other connection is untouched")))
+
+(deftest shutdown!-closes-every-connection-on-every-topic
+  (let [h (hub/in-memory)
+        a (test-conn :one)
+        b (test-conn :one)
+        c (test-conn :two)]
+    (hub/subscribe! h :one a)
+    (hub/subscribe! h :one b)
+    (hub/subscribe! h :two c)
+
+    (hub/shutdown! h)
+
+    (is (= #{} (set (hub/topics h))) "the registry is empty")
+    (is (= [] (hub/conns h :one)))
+    (is (= [] (hub/conns h :two)))
+    (doseq [x [a b c]]
+      (is (false? (queue/offer! (:queue x) :frame)) "every queue is closed"))))
+
+(deftest shutdown!-ends-held-connections-and-closes-their-generators
+  (let [h    (hub/in-memory)
+        resp (hub/connect! h (conn/connector) :room)
+        gen  (adapter.test/->sse-recorder)
+        done (promise)]
+    (Thread/startVirtualThread #(do ((:on-open resp) gen) (deliver done true)))
+    (is (wait-for #(seq (hub/conns h :room))) "connect! subscribed")
+
+    (hub/shutdown! h)
+
+    (is (true? (deref done 2000 ::timeout))
+        "shutdown! ends the drain, so the thread holding the connection open returns")
+    (is (false? @(:!open? gen)) "the SSE generator is closed")
+    (is (= [] (hub/conns h :room)))))
+
+;; -----------------------------------------------------------------------------
+;; connect! lifecycle hooks
+
+(deftest hooks-bracket-the-drain-loop
+  ;; The StubConnector already logs :open/:drain/:close, so the hooks can log
+  ;; into the same atom and the whole ordering falls out as one value.
+  (let [!calls (atom [])
+        h      (hub/in-memory)
+        resp   (hub/connect! h (->StubConnector !calls) :room
+                             {:on-connect    (fn [_] (swap! !calls conj :connect))
+                              :on-disconnect (fn [_] (swap! !calls conj :disconnect))})
+        done   (promise)]
+    (Thread/startVirtualThread #(do ((:on-open resp) ::gen) (deliver done true)))
+    (is (wait-for #(seq (hub/conns h :room))))
+    (queue/close! (:queue (first (hub/conns h :room))))
+
+    (is (true? (deref done 2000 ::timeout)))
+    (is (= [:open :connect :drain :close :disconnect] @!calls)
+        ":on-connect runs before the drain, :on-disconnect after teardown")))
+
+(deftest on-connect-sees-a-subscribed-connection
+  (let [h    (hub/in-memory)
+        seen (promise)
+        resp (hub/connect! h (conn/connector) :room
+                           {:data       {:uid 3}
+                            :on-connect (fn [c] (deliver seen [(conn/data c)
+                                                               (hub/conns h :room)]))})
+        done (promise)]
+    (Thread/startVirtualThread #(do ((:on-open resp) (adapter.test/->sse-recorder))
+                                    (deliver done true)))
+    (let [[data conns] (deref seen 2000 ::timeout)]
+      (is (= {:uid 3} data) ":on-connect receives the Connection, not the generator")
+      (is (= 1 (count conns))
+          "the connection is already on the topic, so a broadcast racing the
+           initial render cannot miss it"))
+    (hub/shutdown! h)
+    (is (true? (deref done 2000 ::timeout)))))
+
+(deftest an-initial-render-sent-from-on-connect-reaches-the-client
+  (let [h    (hub/in-memory)
+        gen  (adapter.test/->sse-recorder)
+        resp (hub/connect! h (conn/connector) :room
+                           {:on-connect (fn [c]
+                                          (hub/send! h c (frame [[:patch-elements "<p>hi</p>"]])))})
+        done (promise)]
+    (Thread/startVirtualThread #(do ((:on-open resp) gen) (deliver done true)))
+    (is (wait-for #(seq @(:!rec gen)))
+        "the frame enqueued from :on-connect is drained, not stranded")
+    (hub/shutdown! h)
+    (is (true? (deref done 2000 ::timeout)))))
+
+(deftest on-disconnect-sees-a-fully-torn-down-connection
+  (let [h    (hub/in-memory)
+        gen  (adapter.test/->sse-recorder)
+        seen (promise)
+        resp (hub/connect! h (conn/connector) :room
+                           {:on-disconnect (fn [c]
+                                             (deliver seen {:conns  (hub/conns h :room)
+                                                            :open?  @(:!open? gen)
+                                                            :topic  (:topic c)}))})]
+    (Thread/startVirtualThread #((:on-open resp) gen))
+    (is (wait-for #(seq (hub/conns h :room))))
+    (hub/shutdown! h)
+
+    (is (= {:conns [] :open? false :topic :room} (deref seen 2000 ::timeout))
+        ":on-disconnect runs after unsubscribe and after the generator is closed")))
+
+(deftest an-on-connect-that-throws-still-tears-the-connection-down
+  (let [h      (hub/in-memory)
+        gen    (adapter.test/->sse-recorder)
+        boom   (ex-info "initial render failed" {})
+        !threw (atom nil)
+        resp   (hub/connect! h (conn/connector) :room
+                             {:on-connect (fn [_] (throw boom))})
+        done   (promise)]
+    (Thread/startVirtualThread
+     #(do (try ((:on-open resp) gen) (catch Exception e (reset! !threw e)))
+          (deliver done true)))
+
+    (is (true? (deref done 2000 ::timeout)))
+    (is (identical? boom @!threw)
+        "the exception surfaces to the adapter rather than being swallowed like
+         a dead client")
+    (is (= [] (hub/conns h :room)) "the connection is not left on the topic")
+    (is (false? @(:!open? gen)) "the generator is closed")))
