@@ -10,8 +10,10 @@
 (defn- read-signals
   "Return the raw Datastar signals payload, or nil when there is nothing to read.
 
-  Adapted from hindsight. This does more than the SDK's `get-signals`, which
-  returns an InputStream for non-GET requests and leaves the rest to you:
+  This does more than the SDK's `get-signals`, which returns an InputStream
+  for non-GET requests and leaves the rest to you. Instead this works
+  as follows:
+
   - GET/DELETE read the `datastar` query param (per the SDK)
   - a body already parsed upstream (muuntaja's `:body-params`) is used as-is
   - anything else is slurped to a string

@@ -15,8 +15,6 @@
   (->Interpreter render write-json))
 
 (defn- ->json
-  "Adapted from hindsight's `ensure-json`: a string is already JSON, a
-  collection is serialized, anything else is a mistake worth naming."
   [{:keys [write-json]} signals]
   (cond
     (string? signals) signals

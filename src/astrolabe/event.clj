@@ -53,10 +53,8 @@
   {:html d*/ns-html :svg d*/ns-svg :mathml d*/ns-mathml})
 
 (defn- enum
-  "Translate a friendly keyword into its SDK constant. Strings pass through --
-  they are assumed to be SDK constants already, which is what hindsight's
-  `#(get patch-modes % %)` fallback bought. Unknown keywords throw, so a typo
-  is a loud error rather than a silently dropped option."
+  "Translate a friendly keyword into its SDK constant. Strings pass
+  through -- they are assumed to be SDK constants already."
   [table label v]
   (cond
     (string? v) v
