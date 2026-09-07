@@ -206,3 +206,43 @@
       (Thread/sleep 200)
       (is (= (count n) (count @(:!rec gen)))
           "no keepalive thread is left running after the connection ends"))))
+
+;; -----------------------------------------------------------------------------
+;; Disconnect reason
+
+(deftest a-live-connection-has-no-disconnect-info
+  (let [conn (conn/-open (conn/connector) (adapter.test/->sse-recorder) :room nil)]
+    (is (nil? (conn/disconnect-info conn))
+        "nil is what separates a live connection from one that is going away")))
+
+(deftest connection-builds-a-connection-that-can-report-why-it-closed
+  ;; The factory exists so a custom Connector cannot forget the closing cell.
+  (let [conn (conn/connection (adapter.test/->sse-recorder) (queue/unbounded) :room {:uid 1})]
+    (is (= :room (:topic conn)))
+    (is (= {:uid 1} (conn/data conn)))
+    (conn/closing! conn :disconnected)
+    (is (= {:reason :disconnected :exception nil} (conn/disconnect-info conn)))))
+
+(deftest closing!-keeps-the-first-reason-it-is-given
+  (let [conn (conn/-open (conn/connector) (adapter.test/->sse-recorder) :room nil)]
+    (conn/closing! conn :client-gone)
+    (conn/closing! conn :shutdown)
+    (is (= {:reason :client-gone :exception nil} (conn/disconnect-info conn))
+        "the cause wins over the consequence: a teardown racing another cannot
+         overwrite why the connection is actually going away")))
+
+(deftest closing!-carries-an-exception-when-given-one
+  (let [conn (conn/-open (conn/connector) (adapter.test/->sse-recorder) :room nil)
+        boom (ex-info "boom" {})]
+    (conn/closing! conn :error boom)
+    (is (= {:reason :error :exception boom} (conn/disconnect-info conn)))))
+
+(deftest a-failed-write-records-client-gone
+  (let [c    (conn/connector {:queue-fn (fn [_] (queue/unbounded))})
+        gen  (->failing-gen 0)
+        conn (conn/-open c gen :room nil)
+        done (drain-on-thread c conn)]
+    (queue/offer! (:queue conn) (a-frame))
+    (is (true? (deref done 2000 ::timeout)) "the failed write ends the drain")
+    (is (= {:reason :client-gone :exception nil} (conn/disconnect-info conn))
+        "the drain names the client going away, the normal end of a connection")))

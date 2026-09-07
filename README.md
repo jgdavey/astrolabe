@@ -317,7 +317,7 @@ just connected has an empty screen. `:on-connect` is where you fill it.
    :on-connect    (fn [conn]
                     (hub/send! hub conn
                                (sse/frame interpreter (views/board (boards/fetch board-id)))))
-   :on-disconnect (fn [conn] (presence/left! board-id (:uid (conn/data conn))))})
+   :on-disconnect (fn [conn _info] (presence/left! board-id (:uid (conn/data conn))))})
 ```
 
 Both hooks receive the `Connection`, so `conn/data` is available to them.
@@ -336,7 +336,40 @@ routine disconnect, and silently serving a blank screen would hide it.
 
 `:on-disconnect` runs last, after the connection has been unsubscribed and its
 generator closed — the place for presence bookkeeping, not for a farewell
-message the client will never receive.
+message the client will never receive. Its second argument says *why* the
+connection ended:
+
+| `:reason` | |
+|---|---|
+| `:client-gone` | the client went away; a write revealed it. The routine case. |
+| `:queue-full` | the client could not keep up and its queue refused a frame |
+| `:disconnected` | the app called `hub/disconnect!` |
+| `:shutdown` | the app called `hub/shutdown!` |
+| `:error` | `:on-connect` or the drain threw; `:exception` carries the throwable |
+| `:unknown` | the queue closed and nothing named a reason |
+
+Which is enough to hang metrics off:
+
+```clojure
+:on-disconnect (fn [conn {:keys [reason exception]}]
+                 (metrics/connections-dec! {:topic  (conn/topic conn)
+                                            :reason reason})
+                 (when exception
+                   (log/error exception "connection ended badly")))
+```
+
+`hub/disconnect!` takes a reason of your own when you have one —
+`(hub/disconnect! hub conn :idle-timeout)` — and `:error` is the only reason
+that carries an `:exception`. A drain that throws is otherwise invisible:
+`connect!` swallows it, because the SDK reports a dead client as a false write
+verdict rather than a throw, so anything that *does* throw there is a bug.
+
+The reason is set by whichever teardown path notices first, and later ones
+cannot overwrite it. Teardown paths race — a client can go away while
+`shutdown!` is walking the registry — and every one of them ends in the same
+closed queue, so first-wins is what keeps the cause from being relabelled by
+its own consequence. `conn/disconnect-info` reads it anywhere you hold the
+connection; it is `nil` while the connection is live.
 
 These are distinct from `:on-close` and `:on-exception`, which `connect!` passes
 straight through to the SDK adapter and which see the raw `sse-gen` rather than
@@ -354,12 +387,15 @@ the `Connection`.
 (hub/broadcast!      hub topic frame)  ; send one frame to every conn on topic
 (hub/broadcast-each! hub topic f)      ; f : conn → frame; one render per connection
 (hub/connect!        hub connector topic opts?)  ; a datastar response that holds open
-(hub/disconnect!     hub conn)         ; drop one connection
+(hub/disconnect!     hub conn reason?) ; drop one connection
 (hub/shutdown!       hub)              ; drop every connection on every topic
 
 ;; connections
 (conn/connector      opts?)            ; build the default connector
+(conn/connection     sse-gen queue topic data)  ; build one, for custom connectors
 (conn/data           conn)             ; app data supplied at connect!
+(conn/topic          conn)             ; the topic it was connected on
+(conn/disconnect-info conn)            ; {:reason .. :exception ..}, nil while live
 ```
 
 Only the first four are the `Hub` protocol. Everything else is a plain function
@@ -566,16 +602,23 @@ until the client disconnects:
     (when on-connect (on-connect conn))   ; initial render, exceptions not swallowed
     (try
       (conn/-drain! connector conn)       ; blocks until the queue closes
-      (catch Exception _ nil))            ; a dead client is normal
+      (catch Exception e                  ; swallowed, but not unrecorded
+        (conn/closing! conn :error e)))
+    (catch Exception e
+      (conn/closing! conn :error e)
+      (throw e))
     (finally
+      (conn/closing! conn :unknown)       ; a no-op unless nothing named a reason
       (unsubscribe! hub topic conn)
       (conn/-close! connector conn)
-      (when on-disconnect (on-disconnect conn)))))
+      (when on-disconnect
+        (on-disconnect conn (conn/disconnect-info conn))))))
 ```
 
 The two `try`s are the difference between a routine disconnect and a bug: the
 inner one swallows drain exceptions because a client going away is normal, while
-an `:on-connect` that throws propagates once cleanup has run.
+an `:on-connect` that throws propagates once cleanup has run. Both record
+`:error` first, so a swallowed exception still reaches `:on-disconnect`.
 
 The connector supplies the `write!` its drain uses, and that is where a
 disconnect is noticed:

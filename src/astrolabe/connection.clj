@@ -10,12 +10,43 @@
             [astrolabe.sse :as sse]
             [starfederation.datastar.clojure.api :as d*]))
 
-(defrecord Connection [sse-gen queue topic data])
+(defrecord Connection [sse-gen queue topic data !closing])
+
+(defn connection
+  "Build a Connection with the cell that records why it closed. Custom
+  connectors should build their connections with this rather than
+  `->Connection`, so that every connection can report a disconnect reason."
+  [sse-gen queue topic data]
+  (->Connection sse-gen queue topic data (atom nil)))
 
 (defn data
   "The app-supplied data attached to a connection at `connect!` time."
   [conn]
   (:data conn))
+
+(defn topic
+  "The topic of the connection, as defined at `connect!` time."
+  [conn]
+  (:topic conn))
+
+(defn closing!
+  "Record why `conn` is going away, as `{:reason ... :exception ...}`.
+
+  The first caller wins. Teardown paths race -- a client can go away while
+  `shutdown!` is walking the registry -- and all of them end in the same closed
+  queue, so whoever notices first names the cause and everything after it is a
+  consequence. Call this *before* closing the queue: closing the queue is what
+  wakes the drain thread that runs `:on-disconnect`."
+  ([conn reason] (closing! conn reason nil))
+  ([conn reason exception]
+   (swap! (:!closing conn) #(or % {:reason reason :exception exception}))
+   nil))
+
+(defn disconnect-info
+  "Why `conn` is going away, as `{:reason ... :exception ...}`, or nil while it
+  is still live. This is what `:on-disconnect` receives as its second argument."
+  [conn]
+  @(:!closing conn))
 
 (defprotocol Connector
   "Spawns connections. Implement this to replace the connection machinery
@@ -63,7 +94,7 @@
 (defrecord DefaultConnector [queue-fn drain heartbeat-ms]
   Connector
   (-open [_ sse-gen topic data]
-    (->Connection sse-gen (queue-fn {:topic topic :data data}) topic data))
+    (connection sse-gen (queue-fn {:topic topic :data data}) topic data))
 
   (-drain! [_ conn]
     (let [{:keys [sse-gen queue]} conn
@@ -74,8 +105,10 @@
                      ;; The client is gone. The SDK never throws for this -- the
                      ;; adapter catches the IOException, closes the generator,
                      ;; and every later write silently returns false -- so this
-                     ;; verdict is the only signal we get. Closing the queue
-                     ;; ends the drain, which lets the caller clean up.
+                     ;; verdict is the only signal we get. Naming the reason
+                     ;; before closing the queue is what makes the routine end
+                     ;; of a connection distinguishable from every other one.
+                     (closing! conn :client-gone)
                      (queue/close! queue)))
           ;; Started here rather than in -open so it brackets whatever `drain`
           ;; is configured: a custom drain loop cannot silently lose keepalives.

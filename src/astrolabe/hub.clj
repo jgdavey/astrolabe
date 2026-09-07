@@ -61,17 +61,25 @@
   (->InMemoryHub (atom {})))
 
 (defn disconnect!
-  "Drop one connection: unsubscribe it and close its queue.
+  "Drop one connection: record why it is going away, unsubscribe it, and close
+  its queue.
 
   Closing the queue is what ends the drain loop, so the thread inside
   [[connect!]] that is holding the connection open returns and runs its own
   cleanup -- which closes the SSE generator. Nothing here touches the
   generator directly, and a connection not held by `connect!` simply leaves
-  the registry with its queue closed."
-  [hub conn]
-  (-unsubscribe! hub (:topic conn) conn)
-  (queue/close! (:queue conn))
-  nil)
+  the registry with its queue closed.
+
+  `reason` defaults to `:disconnected` and reaches `:on-disconnect`; pass your
+  own -- `:idle-timeout`, `:unauthorized` -- when you know it. A connection
+  whose reason is already set keeps it, so dropping a client that has in fact
+  already gone away still reports `:client-gone`."
+  ([hub conn] (disconnect! hub conn :disconnected))
+  ([hub conn reason]
+   (conn/closing! conn reason)
+   (-unsubscribe! hub (:topic conn) conn)
+   (queue/close! (:queue conn))
+   nil))
 
 (defn shutdown!
   "Disconnect every connection on every topic, leaving the registry empty.
@@ -82,7 +90,7 @@
   [hub]
   (doseq [topic (topics hub)
           conn  (conns hub topic)]
-    (disconnect! hub conn))
+    (disconnect! hub conn :shutdown))
   nil)
 
 (defn send!
@@ -91,7 +99,7 @@
   [hub conn frame]
   (let [accepted (boolean (queue/offer! (:queue conn) frame))]
     (when-not accepted
-      (disconnect! hub conn))
+      (disconnect! hub conn :queue-full))
     accepted))
 
 (defn broadcast!
@@ -133,8 +141,16 @@
                      Unlike a dead client, an exception here is not swallowed:
                      the connection is torn down and the exception reaches the
                      adapter, and so `:on-exception`.
-  - `:on-disconnect` `(fn [conn])` run after the connection is unsubscribed and
-                     its generator closed
+  - `:on-disconnect` `(fn [conn info])` run after the connection is
+                     unsubscribed and its generator closed. `info` is
+                     `{:reason ... :exception ...}` -- see
+                     [[astrolabe.connection/disconnect-info]] -- where `:reason`
+                     is one of `:client-gone` (the write that revealed it),
+                     `:queue-full` (the client could not keep up),
+                     `:shutdown`, `:disconnected` or whatever reason was passed
+                     to [[disconnect!]], `:error` (`:on-connect` or the drain
+                     threw, and `:exception` is the throwable), or `:unknown`
+                     (the queue closed and nothing named a reason)
   - `:on-close`      SDK on-close callback, passed through to the response
   - `:on-exception`  SDK on-exception callback, passed through to the response
 
@@ -151,11 +167,23 @@
                    (when on-connect (on-connect c))
                    (try
                      (conn/-drain! connector c)
-                     (catch Exception _
-                       nil))   ; a dead client is normal; fall through to cleanup
+                     ;; The SDK reports a dead client as a false write verdict,
+                     ;; never as a throw, so the drain thread has already named
+                     ;; that -- an exception here is a bug, and swallowing it
+                     ;; without recording it is what used to hide it.
+                     (catch Exception e
+                       (conn/closing! c :error e)))
+                   (catch Exception e
+                     (conn/closing! c :error e)
+                     (throw e))
                    (finally
+                     ;; A no-op unless every path above stayed silent, which
+                     ;; only a custom drain or a queue closed behind the hub's
+                     ;; back can manage. Settled here so -close! sees it too.
+                     (conn/closing! c :unknown)
                      (-unsubscribe! hub topic c)
                      (conn/-close! connector c)
-                     (when on-disconnect (on-disconnect c))))))}
+                     (when on-disconnect
+                       (on-disconnect c (conn/disconnect-info c)))))))}
       on-close     (assoc :on-close on-close)
       on-exception (assoc :on-exception on-exception)))))

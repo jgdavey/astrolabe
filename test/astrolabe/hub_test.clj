@@ -15,7 +15,7 @@
 (defn- test-conn
   ([topic] (test-conn topic nil))
   ([topic data]
-   (conn/->Connection (adapter.test/->sse-recorder) (queue/unbounded) topic data)))
+   (conn/connection (adapter.test/->sse-recorder) (queue/unbounded) topic data)))
 
 (defrecord FailingGen [lock !writes !closed? max-writes]
   p/SSEGenerator
@@ -128,7 +128,7 @@
 
 (deftest a-refusing-queue-closes-its-connection
   (let [h    (hub/in-memory)
-        full (conn/->Connection (adapter.test/->sse-recorder) (queue/bounded 1) :room nil)
+        full (conn/connection (adapter.test/->sse-recorder) (queue/bounded 1) :room nil)
         ok   (test-conn :room)]
     (doseq [c [full ok]] (hub/subscribe! h :room c))
 
@@ -140,7 +140,7 @@
 
 (deftest broadcast!-is-not-stalled-by-a-slow-client
   (let [h    (hub/in-memory)
-        slow (conn/->Connection (adapter.test/->sse-recorder) (queue/latest) :room nil)
+        slow (conn/connection (adapter.test/->sse-recorder) (queue/latest) :room nil)
         fast (test-conn :room)
         f    (frame [[:remove-element "#x"]])]
     (doseq [c [slow fast]] (hub/subscribe! h :room c))
@@ -186,7 +186,7 @@
   conn/Connector
   (-open [_ sse-gen topic data]
     (swap! !calls conj :open)
-    (conn/->Connection sse-gen (queue/unbounded) topic data))
+    (conn/connection sse-gen (queue/unbounded) topic data))
   (-drain! [_ c]
     (swap! !calls conj :drain)
     (loop [] (when (queue/take! (:queue c)) (recur))))
@@ -342,7 +342,7 @@
         h      (hub/in-memory)
         resp   (hub/connect! h (->StubConnector !calls) :room
                              {:on-connect    (fn [_] (swap! !calls conj :connect))
-                              :on-disconnect (fn [_] (swap! !calls conj :disconnect))})
+                              :on-disconnect (fn [_ _] (swap! !calls conj :disconnect))})
         done   (promise)]
     (Thread/startVirtualThread #(do ((:on-open resp) ::gen) (deliver done true)))
     (is (wait-for #(seq (hub/conns h :room))))
@@ -388,7 +388,7 @@
         gen  (adapter.test/->sse-recorder)
         seen (promise)
         resp (hub/connect! h (conn/connector) :room
-                           {:on-disconnect (fn [c]
+                           {:on-disconnect (fn [c _]
                                              (deliver seen {:conns  (hub/conns h :room)
                                                             :open?  @(:!open? gen)
                                                             :topic  (:topic c)}))})]
@@ -417,3 +417,117 @@
          a dead client")
     (is (= [] (hub/conns h :room)) "the connection is not left on the topic")
     (is (false? @(:!open? gen)) "the generator is closed")))
+
+;; -----------------------------------------------------------------------------
+;; Disconnect reason
+
+(defn- info-seen-by-on-disconnect
+  "Hold a connection open with `connect!` and return the info map its
+  `:on-disconnect` received. `opts` is merged over the hook, and `f` is called
+  with the live Connection once it is on the topic -- the chance to end it."
+  ([h] (info-seen-by-on-disconnect h (conn/connector) (adapter.test/->sse-recorder) {} (fn [_])))
+  ([h connector gen opts f]
+   (let [seen (promise)
+         resp (hub/connect! h connector :room
+                            (merge {:on-disconnect (fn [_ info] (deliver seen info))} opts))]
+     ;; on-connect exceptions propagate by design; the adapter, not this thread,
+     ;; is what normally sees them.
+     (Thread/startVirtualThread #(try ((:on-open resp) gen) (catch Exception _ nil)))
+     (when (wait-for #(seq (hub/conns h :room)))
+       (f (first (hub/conns h :room))))
+     (deref seen 2000 ::timeout))))
+
+(deftest disconnect!-records-why-the-connection-left
+  (let [h (hub/in-memory)
+        a (test-conn :room)]
+    (hub/subscribe! h :room a)
+    (hub/disconnect! h a)
+    (is (= {:reason :disconnected :exception nil} (conn/disconnect-info a))
+        "an app-initiated disconnect is not a client going away")))
+
+(deftest disconnect!-takes-a-caller-supplied-reason
+  (let [h (hub/in-memory)
+        a (test-conn :room)]
+    (hub/subscribe! h :room a)
+    (hub/disconnect! h a :idle-timeout)
+    (is (= {:reason :idle-timeout :exception nil} (conn/disconnect-info a))
+        "an app that knows why it is dropping a client can say so")))
+
+(deftest shutdown!-records-shutdown
+  (let [h (hub/in-memory)
+        a (test-conn :one)
+        b (test-conn :two)]
+    (hub/subscribe! h :one a)
+    (hub/subscribe! h :two b)
+
+    (hub/shutdown! h)
+
+    (doseq [c [a b]]
+      (is (= {:reason :shutdown :exception nil} (conn/disconnect-info c))
+          "a server going down is distinguishable from a client going away"))))
+
+(deftest a-refusing-queue-records-queue-full
+  (let [h    (hub/in-memory)
+        full (conn/connection (adapter.test/->sse-recorder) (queue/bounded 1) :room nil)]
+    (hub/subscribe! h :room full)
+
+    (hub/send! h full (frame [[:remove-element "#a"]]))   ; fills it
+    (hub/send! h full (frame [[:remove-element "#b"]]))   ; refused
+
+    (is (= {:reason :queue-full :exception nil} (conn/disconnect-info full))
+        "a client too slow to keep up is a distinct failure from one that left")))
+
+(deftest a-client-that-went-away-is-not-relabelled-by-the-teardown-that-follows
+  ;; The drain notices the client first and closes the queue; whatever tears the
+  ;; connection down next must not overwrite the cause with its own consequence.
+  (let [h (hub/in-memory)
+        a (test-conn :room)]
+    (hub/subscribe! h :room a)
+    (conn/closing! a :client-gone)
+
+    (hub/disconnect! h a)
+
+    (is (= {:reason :client-gone :exception nil} (conn/disconnect-info a)))))
+
+(deftest on-disconnect-receives-the-reason
+  (let [h (hub/in-memory)]
+    (is (= {:reason :kicked :exception nil}
+           (info-seen-by-on-disconnect h (conn/connector) (adapter.test/->sse-recorder) {}
+                                       #(hub/disconnect! h % :kicked))))))
+
+(deftest on-disconnect-reports-a-client-that-went-away
+  (let [h (hub/in-memory)]
+    (is (= {:reason :client-gone :exception nil}
+           (info-seen-by-on-disconnect
+            h (conn/connector) (->failing-gen 0)
+            {:on-connect (fn [c] (hub/send! h c (frame [[:remove-element "#x"]])))}
+            (fn [_])))
+        "the write that fails is the one that names the reason")))
+
+(deftest on-disconnect-reports-unknown-when-nothing-named-a-reason
+  (let [h (hub/in-memory)]
+    (is (= {:reason :unknown :exception nil}
+           (info-seen-by-on-disconnect h (conn/connector) (adapter.test/->sse-recorder) {}
+                                       #(queue/close! (:queue %))))
+        "a queue closed behind the hub's back is honestly unknown, not a guess")))
+
+(deftest on-disconnect-reports-an-on-connect-that-threw
+  (let [h    (hub/in-memory)
+        boom (ex-info "initial render failed" {})
+        info (info-seen-by-on-disconnect h (conn/connector) (adapter.test/->sse-recorder)
+                                         {:on-connect (fn [_] (throw boom))}
+                                         (fn [_]))]
+    (is (= :error (:reason info)))
+    (is (identical? boom (:exception info))
+        "the throwable reaches :on-disconnect even though the drain never ran")))
+
+(deftest on-disconnect-reports-a-drain-that-threw
+  (let [h    (hub/in-memory)
+        boom (ex-info "drain blew up" {})
+        info (info-seen-by-on-disconnect h
+                                         (conn/connector {:drain (fn [_ _ _] (throw boom))})
+                                         (adapter.test/->sse-recorder) {} (fn [_]))]
+    (is (= :error (:reason info)))
+    (is (identical? boom (:exception info))
+        "a drain exception is swallowed, so :on-disconnect is the only place it
+         ever surfaces")))
