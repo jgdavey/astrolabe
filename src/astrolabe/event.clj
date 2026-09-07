@@ -23,7 +23,7 @@
       (throw (ex-info "Event missing primary argument" {:op op :event event})))
     (when (> n 3)
       (throw (ex-info "Event has too many elements" {:event event})))
-    (when (and (= n 3) (not (map? opts)))
+    (when (and (= n 3) (not (or (nil? opts) (map? opts))))
       (throw (ex-info "Event options must be a map" {:opts opts :event event})))
     (assoc (or opts {}) :op op pk primary)))
 
