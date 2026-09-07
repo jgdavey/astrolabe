@@ -8,4 +8,7 @@
                                   dev.data-star.clojure/brotli {:mvn/version "1.0.0-RC11"}
                                   metosin/reitit-ring          {:mvn/version "0.10.1"}}}
            :kaocha {:main-opts  ["-m" "kaocha.runner"]
-                    :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}}}}}
+                    :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
+           :build {:deps {io.github.clojure/tools.build {:git/tag "v0.10.14" :git/sha "1176afd"}
+                          slipset/deps-deploy {:mvn/version "0.2.5"}}
+                   :ns-default build}}}
