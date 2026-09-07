@@ -9,11 +9,19 @@
 (def target-dir "target")
 (def class-dir "target/classes")
 
+(def pom-template
+  [[:licenses
+    [:license
+     [:name "Eclipse Public License 1.0"]
+     [:url "https://www.eclipse.org/legal/epl-v10.html"]
+     [:distribution "repo"]]]])
+
 (defn- jar-opts [opts]
   (assoc opts
           :lib lib :version version
           :jar-file (format "target/%s-%s.jar" lib version)
           :scm {:tag (str "v" version)}
+          :pom-data pom-template
           :basis (b/create-basis {})
           :class-dir class-dir
           :target target-dir

@@ -808,4 +808,7 @@ detect a dead client by catching exceptions will not see one.
 
 ## License
 
-TBD.
+Copyright © 2026 Joshua Davey
+
+Distributed under the [Eclipse Public License 1.0](https://www.eclipse.org/legal/epl-v10.html),
+the same license as Clojure. See [LICENSE](LICENSE).
