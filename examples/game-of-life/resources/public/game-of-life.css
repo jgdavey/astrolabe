@@ -1,0 +1,81 @@
+/* Ported from the hyperlith game_of_life example's static-css.
+   `--cols` is set inline on .board by the view, so the grid stays in step
+   with `board-size` in game-of-life.main. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 18px;
+  color: black;
+}
+
+.main {
+  height: 100dvh;
+  width: min(100% - 2rem, 30rem);
+  margin-inline: auto;
+  padding-block: 2dvh;
+  display: flex;
+  gap: 5px;
+  flex-direction: column;
+}
+
+.main p {
+  font-size: 0.75rem;
+}
+
+.board {
+  background: white;
+  width: min(100% - 2rem, 30rem);
+  display: grid;
+  aspect-ratio: 1 / 1;
+  grid-template-rows: repeat(var(--cols), 1fr);
+  grid-template-columns: repeat(var(--cols), 1fr);
+  /* so dragging across the board on a touchscreen paints rather than scrolls */
+  touch-action: none;
+}
+
+.tile {
+  border-bottom: 1px solid black;
+  border-right: 1px solid black;
+}
+
+.dead {
+  background: white;
+}
+
+.red {
+  background: red;
+  transition: background 0.6s ease;
+}
+
+.blue {
+  background: blue;
+  transition: background 0.6s ease;
+}
+
+.green {
+  background: green;
+  transition: background 0.6s ease;
+}
+
+.orange {
+  background: orange;
+  transition: background 0.6s ease;
+}
+
+.fuchsia {
+  background: fuchsia;
+  transition: background 0.6s ease;
+}
+
+.purple {
+  background: purple;
+  transition: background 0.6s ease;
+}

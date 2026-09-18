@@ -799,6 +799,13 @@ on an ordinary disconnect — its adapters catch the IOException and report the
 closure as a `false` return from the next write — so a drain that tries to
 detect a dead client by catching exceptions will not see one.
 
+## Examples
+
+- [`examples/game-of-life`](examples/game-of-life) — multiplayer Conway's Game
+  of Life, a port of [hyperlith's example](https://github.com/andersmurphy/hyperlith/tree/master/examples/game_of_life)
+  and a worked version of the [state-based recipe](#state-based-recipe) on
+  http-kit, with streaming Brotli doing what it says on the tin.
+
 ## Prior art & thanks
 
 - [`datastar-clojure`](https://github.com/starfederation/datastar-clojure) — the

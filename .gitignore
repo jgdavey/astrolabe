@@ -16,3 +16,7 @@
 
 # subagent-driven-development workspace
 /.superpowers/
+
+# examples
+examples/*/.cpcache/
+examples/*/target/
